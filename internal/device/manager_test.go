@@ -141,6 +141,52 @@ func TestManagerRefreshBuildsEC20Snapshot(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestManagerRefreshBuildsNativeWWANSnapshotFromQualcommATI(t *testing.T) {
+	client := &transcriptClient{steps: []clientStep{
+		{command: "ATI", response: okResponse(
+			"Manufacturer: QUALCOMM INCORPORATED",
+			"Model: 4094",
+			"Revision: MPSS.DPM.2.0",
+			"IMEI: 866340055929387",
+		)},
+		{command: "AT+CPIN?", response: okResponse("+CPIN: READY")},
+		{command: "AT+CCID", err: errors.New("CCID unsupported")},
+		{command: "AT+QCCID", err: errors.New("QCCID unsupported")},
+		{command: "AT+ICCID", response: okResponse("ICCID: 894921007608519523")},
+		{command: "AT+CIMI", response: okResponse("515031234567890")},
+		{command: "AT+CRSM=176,28486,0,0,17", err: errors.New("SPN unsupported")},
+		{command: "AT+CRSM=192,28589,0,0,0", err: errors.New("MNC length unsupported")},
+		{command: "AT+CRSM=192,28478,0,0,0", err: errors.New("GID1 unsupported")},
+		{command: "AT+CRSM=192,28479,0,0,0", err: errors.New("GID2 unsupported")},
+		{command: "AT+CSQ", response: okResponse("+CSQ: 15,99")},
+		{command: `AT+QENG="servingcell"`, err: errors.New("serving cell unsupported")},
+		{command: "AT+COPS?", response: okResponse("+COPS: 0")},
+		{command: "AT+CEREG?", response: okResponse("+CEREG: 0,0")},
+		{command: "AT+CFUN?", response: okResponse("+CFUN: 0")},
+		{command: "AT+CNUM", response: okResponse(`+CNUM: "","+639171234567",145`)},
+	}}
+	manager, id := newStartedTestManager(t, client)
+
+	snapshot, err := manager.Refresh(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if snapshot.Manufacturer != "QUALCOMM INCORPORATED" ||
+		snapshot.Model != "4094" || snapshot.Firmware != "MPSS.DPM.2.0" {
+		t.Fatalf("identity = %#v", snapshot)
+	}
+	if snapshot.IMEI != "866340055929387" ||
+		snapshot.ICCID != "894921007608519523" ||
+		snapshot.IMSI != "515031234567890" {
+		t.Fatalf("subscriber identifiers = %#v", snapshot)
+	}
+	if !snapshot.SIMReady || !snapshot.ModeKnown || snapshot.OperatingMode != 0 ||
+		!snapshot.FlightMode || !snapshot.RadioOff {
+		t.Fatalf("SIM/radio state = %#v", snapshot)
+	}
+	client.assertDone(t)
+}
+
 func TestParseSPNASCIIAndUCS2(t *testing.T) {
 	if got := parseSPN(okResponse(`+CRSM: 144,0,"004C6562617261FFFFFFFFFFFFFFFFFFFF"`)); got != "Lebara" {
 		t.Fatalf("ASCII SPN = %q", got)
