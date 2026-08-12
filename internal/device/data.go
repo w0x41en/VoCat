@@ -84,6 +84,31 @@ func (manager *Manager) SetNetwork(
 		}
 	}
 	candidate := manager.candidateFor(state)
+	// OpenStick's native WWAN path must drive registration through QMI NAS.
+	// AT+COPS only updates the legacy AT facade on this firmware and can leave
+	// NAS in not-registered-searching, which then makes qmi-network report a
+	// generic no-service failure.
+	if request.Enabled && isNativeQMICandidate(candidate) {
+		registrationContext, cancel := context.WithTimeout(ctx, manager.scanTimeout)
+		registrationSession, openErr := manager.openNativeQMIRegistration(registrationContext, candidate)
+		if openErr != nil {
+			cancel()
+			manager.setResult(id, state, nil, openErr)
+			return NetworkResult{}, fmt.Errorf("prepare native QMI registration: %w", openErr)
+		}
+		registrationErr := ensureNativeQMIRegistration(
+			registrationContext,
+			registrationSession,
+			qmiRegistrationRequestAutomatic(),
+			true,
+		)
+		_ = registrationSession.Close()
+		cancel()
+		if registrationErr != nil {
+			manager.setResult(id, state, nil, registrationErr)
+			return NetworkResult{}, registrationErr
+		}
+	}
 	backend := strings.ToLower(strings.TrimSpace(request.Backend))
 	if backend == "" {
 		if candidate.QMIControl != "" && candidate.NetworkInterface != "" {
