@@ -21,9 +21,10 @@ export function OverviewSimPanel({ device, simOperatorDisplay, customPhoneNumber
   const modem = device.modem;
   const sensitive = !showSensitive;
   const activeEsim = (device.activeEsimProfileName || "").trim();
-  const flightOn = device.vowifiActive || modem?.operatingMode === 0 || modem?.operatingMode === 4;
+  const flightOn =
+    device.flightMode || device.vowifiActive || [0, 4, 7].includes(Number(modem?.operatingMode));
   const carrierCountryCode = String(modem?.homeCarrierCountryCode ?? "").trim() || carrierIso(modem?.imsi);
-  const displayedPhoneNumber = customPhoneNumber?.trim() || device.localPhone || "--";
+  const displayedPhoneNumber = customPhoneNumber?.trim() || device.localPhone || modem?.phoneNumberStatus || "--";
   const backendLabel =
     device.backendMode === "qmi" ? "QMI" : device.backendMode === "mbim" ? "MBIM" : device.backendMode === "at" ? "AT" : "Auto";
 
@@ -42,7 +43,13 @@ export function OverviewSimPanel({ device, simOperatorDisplay, customPhoneNumber
         <FieldRow label="IMEI" value={modem?.imei} sensitive={sensitive} monospace copyable />
         <FieldRow label="ICCID" value={modem?.iccid} sensitive={sensitive} monospace copyable />
         <FieldRow label="IMSI" value={modem?.imsi} sensitive={sensitive} monospace copyable />
-        <FieldRow label={t("本机号码")} value={displayedPhoneNumber} sensitive={sensitive} monospace copyable />
+        <FieldRow
+          label={t("本机号码")}
+          value={displayedPhoneNumber}
+          sensitive={sensitive}
+          monospace
+          copyable={Boolean(customPhoneNumber?.trim() || device.localPhone)}
+        />
         {device?.e911SetupAvailable ? (
           <div className="flex justify-between gap-3">
             <span className="text-gray-500">{t("E911地址")}</span>

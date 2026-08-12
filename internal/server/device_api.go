@@ -1963,6 +1963,7 @@ func modemSummary(snapshot *device.Snapshot, phone string, phoneSource string) m
 			"sim_inserted":              false,
 			"phone_number":              phone,
 			"phone_number_source":       phoneSource,
+			"phone_number_status":       "",
 			"model":                     "",
 		}
 	}
@@ -2008,7 +2009,15 @@ func modemSummary(snapshot *device.Snapshot, phone string, phoneSource string) m
 		"operating_mode":            snapshot.OperatingMode,
 		"phone_number":              phone,
 		"phone_number_source":       phoneSource,
+		"phone_number_status":       phoneStatus(snapshot),
 	}
+}
+
+func phoneStatus(snapshot *device.Snapshot) string {
+	if snapshot == nil {
+		return ""
+	}
+	return snapshot.Phone.Status
 }
 
 func snapshotHasSIM(snapshot *device.Snapshot) bool {
