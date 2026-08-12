@@ -19,6 +19,16 @@ type qmiRadioSession interface {
 	Close() error
 }
 
+// qmiNativeSnapshotSession is the optional QMI data surface used by native
+// WWAN devices for fields that Qualcomm firmware does not expose through the
+// AT port.  Keep it separate from qmiRadioSession so transcript-backed and
+// AT-only devices do not need to implement these queries.
+type qmiNativeSnapshotSession interface {
+	qmiRadioSession
+	GetMSISDN(context.Context) (string, error)
+	GetRFBandInfo(context.Context) (*qmi.RFBandInfo, error)
+	GetCellLocationInfo(context.Context) (*qmi.CellLocationInfo, error)
+}
 type qmiRadioSessionOpener func(context.Context, string) (qmiRadioSession, error)
 
 // nativeQMIControl identifies the QMI control node exposed by native WWAN
@@ -45,6 +55,8 @@ func (manager *Manager) nativeQMIControl(id string) (string, bool, error) {
 type productionQMIRadioSession struct {
 	client *qmi.Client
 	dms    *qmi.DMSService
+	nas    *qmi.NASService
+	nasErr error
 	lease  *qmiport.Lease
 }
 
@@ -140,11 +152,48 @@ func openQMIRadioSession(ctx context.Context, controlDevice string) (qmiRadioSes
 		lease.Release()
 		return nil, err
 	}
-	return &productionQMIRadioSession{client: client, dms: dms, lease: lease}, nil
+	// NAS is optional for ordinary radio controls. Some firmware exposes DMS
+	// but rejects NAS client allocation; keep radio control usable and report
+	// that limitation only to native registration/RF queries.
+	nas, nasErr := qmi.NewNASServiceWithContext(openContext, client)
+	return &productionQMIRadioSession{
+		client: client,
+		dms:    dms,
+		nas:    nas,
+		nasErr: nasErr,
+		lease:  lease,
+	}, nil
 }
 
 func (session *productionQMIRadioSession) GetOperatingMode(ctx context.Context) (qmi.OperatingMode, error) {
 	return session.dms.GetOperatingMode(ctx)
+}
+
+func (session *productionQMIRadioSession) GetICCID(ctx context.Context) (string, error) {
+	return session.dms.GetICCID(ctx)
+}
+
+func (session *productionQMIRadioSession) GetMSISDN(ctx context.Context) (string, error) {
+	if session == nil || session.dms == nil {
+		return "", errors.New("QMI DMS session is unavailable")
+	}
+	return session.dms.GetMSISDN(ctx)
+}
+
+func (session *productionQMIRadioSession) GetRFBandInfo(ctx context.Context) (*qmi.RFBandInfo, error) {
+	nas, err := session.nasService()
+	if err != nil {
+		return nil, err
+	}
+	return nas.GetRFBandInfo(ctx)
+}
+
+func (session *productionQMIRadioSession) GetCellLocationInfo(ctx context.Context) (*qmi.CellLocationInfo, error) {
+	nas, err := session.nasService()
+	if err != nil {
+		return nil, err
+	}
+	return nas.GetCellLocationInfo(ctx)
 }
 
 func (session *productionQMIRadioSession) SetOperatingMode(ctx context.Context, mode qmi.OperatingMode) error {
