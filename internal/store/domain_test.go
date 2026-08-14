@@ -71,6 +71,120 @@ func TestMigrationFromAuthenticationSchema(t *testing.T) {
 	}
 }
 
+func TestMigrationFromOriginMasterSchema16AddsCarrierColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "origin-master-v16.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE devices (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			apn TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE card_policies (
+			iccid TEXT PRIMARY KEY,
+			network_enabled INTEGER NOT NULL DEFAULT 0 CHECK (network_enabled IN (0, 1)),
+			vowifi_enabled INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_enabled IN (0, 1)),
+			airplane_enabled INTEGER NOT NULL DEFAULT 0 CHECK (airplane_enabled IN (0, 1)),
+			apn TEXT NOT NULL DEFAULT '',
+			ip_version TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			custom_phone_number TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE card_apn_profiles (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			iccid TEXT NOT NULL,
+			apn TEXT NOT NULL,
+			ip_version TEXT NOT NULL DEFAULT 'IPV4V6' CHECK (ip_version IN ('IP', 'IPV6', 'IPV4V6')),
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			username TEXT NOT NULL DEFAULT '',
+			password TEXT NOT NULL DEFAULT '',
+			proxy TEXT NOT NULL DEFAULT '',
+			mcc TEXT NOT NULL DEFAULT '',
+			mnc TEXT NOT NULL DEFAULT '',
+			roaming_ip_version TEXT NOT NULL DEFAULT 'IP' CHECK (roaming_ip_version IN ('IP', 'IPV6', 'IPV4V6')),
+			auth_type TEXT NOT NULL DEFAULT 'NONE' CHECK (auth_type IN ('NONE', 'PAP', 'CHAP', 'PAP_OR_CHAP')),
+			UNIQUE (iccid, apn, ip_version),
+			FOREIGN KEY (iccid) REFERENCES card_policies(iccid) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX card_apn_profiles_iccid_idx ON card_apn_profiles(iccid, id)`,
+		`INSERT INTO devices (id, name, apn, created_at, updated_at)
+			VALUES ('legacy-v16', 'Legacy v16', 'carrier.data', 100, 100)`,
+		`PRAGMA user_version = 16`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("create origin/master v16 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database := openTestStore(t, path)
+	defer database.Close()
+	var version int
+	if err := database.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+	var imsAPN, transport, eap string
+	var allowDerived, allowSHA1, useMODP1024 int
+	if err := database.db.QueryRowContext(ctx, `
+		SELECT ims_apn, ims_transport, vowifi_eap_method,
+			ims_allow_imsi_derived_identity, vowifi_allow_sha1, vowifi_use_modp1024
+		FROM devices WHERE id = 'legacy-v16'
+	`).Scan(&imsAPN, &transport, &eap, &allowDerived, &allowSHA1, &useMODP1024); err != nil {
+		t.Fatalf("carrier columns missing after v16 migration: %v", err)
+	}
+	if imsAPN != "ims" || transport != "tcp" || eap != "aka" || allowDerived != 1 || allowSHA1 != 0 || useMODP1024 != 0 {
+		t.Fatalf("carrier defaults after v16 migration = (%q, %q, %q, %d, %d, %d)", imsAPN, transport, eap, allowDerived, allowSHA1, useMODP1024)
+	}
+}
+
+func TestMigration19RepairsEarlierBranchSchema18(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "earlier-branch-v18.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+		`PRAGMA user_version = 18`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("create earlier branch v18 schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database := openTestStore(t, path)
+	defer database.Close()
+	var count int
+	if err := database.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pragma_table_info('devices')
+		WHERE name IN ('ims_apn', 'vowifi_allow_sha1', 'vowifi_use_modp1024')
+	`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("migration 19 added %d of 3 carrier columns", count)
+	}
+}
+
 func TestMigration17RepairsLegacySchema10AutomaticTaskTables(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy-schema10.db")
@@ -233,6 +347,7 @@ func TestMigration18RepairsLegacyVoWiFiAirplaneConstraint(t *testing.T) {
 	}
 	for _, statement := range []string{
 		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE devices (id TEXT PRIMARY KEY)`,
 		`CREATE TABLE card_policies (
 			iccid TEXT PRIMARY KEY,
 			network_enabled INTEGER NOT NULL DEFAULT 0 CHECK (network_enabled IN (0, 1)),

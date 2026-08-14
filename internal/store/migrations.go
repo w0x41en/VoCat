@@ -263,54 +263,13 @@ func migrationStatements(version int) []string {
 	case 16:
 		return []string{`ALTER TABLE devices ADD COLUMN sim_pin TEXT NOT NULL DEFAULT ''`}
 	case 17:
-		// Migration 10 originally only added VoWiFi columns on the local
-		// Qualcomm branch. Existing databases at user_version=10 therefore
-		// never replay the later table additions that were merged into it.
-		return []string{
-			`CREATE TABLE IF NOT EXISTS automatic_tasks (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				name TEXT NOT NULL,
-				enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-				device_id TEXT NOT NULL,
-				profile_iccid TEXT NOT NULL,
-				profile_aid TEXT NOT NULL DEFAULT '',
-				task_type TEXT NOT NULL CHECK (task_type IN ('sms', 'call', 'public_ip')),
-				environment TEXT NOT NULL CHECK (environment IN ('vowifi', 'cellular')),
-				interval_days INTEGER NOT NULL CHECK (interval_days BETWEEN 1 AND 365),
-				start_date TEXT NOT NULL,
-				run_time TEXT NOT NULL,
-				timezone TEXT NOT NULL DEFAULT 'Local',
-				payload_json TEXT NOT NULL DEFAULT '{}',
-				retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 10),
-				notify INTEGER NOT NULL DEFAULT 0 CHECK (notify IN (0, 1)),
-				next_run_at INTEGER NOT NULL,
-				last_run_at INTEGER NOT NULL DEFAULT 0,
-				last_status TEXT NOT NULL DEFAULT '',
-				last_error TEXT NOT NULL DEFAULT '',
-				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL,
-				FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
-			)`,
-			`CREATE INDEX IF NOT EXISTS automatic_tasks_due_idx ON automatic_tasks(enabled, next_run_at, id)`,
-			`CREATE INDEX IF NOT EXISTS automatic_tasks_device_idx ON automatic_tasks(device_id, next_run_at, id)`,
-			`CREATE TABLE IF NOT EXISTS automatic_task_runs (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				task_id INTEGER NOT NULL,
-				device_id TEXT NOT NULL,
-				scheduled_at INTEGER NOT NULL,
-				started_at INTEGER NOT NULL DEFAULT 0,
-				finished_at INTEGER NOT NULL DEFAULT 0,
-				status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
-				attempts INTEGER NOT NULL DEFAULT 0,
-				output TEXT NOT NULL DEFAULT '',
-				error TEXT NOT NULL DEFAULT '',
-				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL,
-				FOREIGN KEY (task_id) REFERENCES automatic_tasks(id) ON DELETE CASCADE
-			)`,
-			`CREATE INDEX IF NOT EXISTS automatic_task_runs_task_idx ON automatic_task_runs(task_id, id DESC)`,
-			`CREATE INDEX IF NOT EXISTS automatic_task_runs_status_idx ON automatic_task_runs(status, id)`,
-		}
+		// origin/master schema v16 does not contain the carrier-profile and
+		// legacy-IKE columns introduced by the Qualcomm/VoWiFi work. They must
+		// be added after v16; changing migration 9/10 alone cannot help a
+		// database whose user_version is already 16. The migration runner treats
+		// duplicate ADD COLUMN errors as idempotent so databases that already
+		// passed through the local v9/v10 migrations are safe as well.
+		return append(deviceCarrierProfileMigrationStatements(), automaticTaskMigrationStatements()...)
 	case 18:
 		// Some databases were created from the initial domain schema after the
 		// RF-safe policy check was added. That check contradicts the intended
@@ -367,8 +326,75 @@ func migrationStatements(version int) []string {
 			`ALTER TABLE card_apn_profiles_new RENAME TO card_apn_profiles`,
 			`CREATE INDEX card_apn_profiles_iccid_idx ON card_apn_profiles(iccid, id)`,
 		}
+	case 19:
+		// Repair databases that were already upgraded by an earlier build of
+		// this branch. Such databases can report user_version=18 while still
+		// lacking the columns above, so keep a final additive repair migration.
+		return deviceCarrierProfileMigrationStatements()
 	default:
 		return nil
+	}
+}
+
+func deviceCarrierProfileMigrationStatements() []string {
+	return []string{
+		`ALTER TABLE devices ADD COLUMN ims_apn TEXT NOT NULL DEFAULT 'ims'`,
+		`ALTER TABLE devices ADD COLUMN ims_private_identity TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN ims_public_identity TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN ims_sms_center TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE devices ADD COLUMN ims_transport TEXT NOT NULL DEFAULT 'tcp'`,
+		`ALTER TABLE devices ADD COLUMN ims_allow_imsi_derived_identity INTEGER NOT NULL DEFAULT 1 CHECK (ims_allow_imsi_derived_identity IN (0, 1))`,
+		`ALTER TABLE devices ADD COLUMN vowifi_eap_method TEXT NOT NULL DEFAULT 'aka'`,
+		`ALTER TABLE devices ADD COLUMN vowifi_allow_sha1 INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_allow_sha1 IN (0, 1))`,
+		`ALTER TABLE devices ADD COLUMN vowifi_use_modp1024 INTEGER NOT NULL DEFAULT 0 CHECK (vowifi_use_modp1024 IN (0, 1))`,
+	}
+}
+
+func automaticTaskMigrationStatements() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS automatic_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+			device_id TEXT NOT NULL,
+			profile_iccid TEXT NOT NULL,
+			profile_aid TEXT NOT NULL DEFAULT '',
+			task_type TEXT NOT NULL CHECK (task_type IN ('sms', 'call', 'public_ip')),
+			environment TEXT NOT NULL CHECK (environment IN ('vowifi', 'cellular')),
+			interval_days INTEGER NOT NULL CHECK (interval_days BETWEEN 1 AND 365),
+			start_date TEXT NOT NULL,
+			run_time TEXT NOT NULL,
+			timezone TEXT NOT NULL DEFAULT 'Local',
+			payload_json TEXT NOT NULL DEFAULT '{}',
+			retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 10),
+			notify INTEGER NOT NULL DEFAULT 0 CHECK (notify IN (0, 1)),
+			next_run_at INTEGER NOT NULL,
+			last_run_at INTEGER NOT NULL DEFAULT 0,
+			last_status TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS automatic_tasks_due_idx ON automatic_tasks(enabled, next_run_at, id)`,
+		`CREATE INDEX IF NOT EXISTS automatic_tasks_device_idx ON automatic_tasks(device_id, next_run_at, id)`,
+		`CREATE TABLE IF NOT EXISTS automatic_task_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id INTEGER NOT NULL,
+			device_id TEXT NOT NULL,
+			scheduled_at INTEGER NOT NULL,
+			started_at INTEGER NOT NULL DEFAULT 0,
+			finished_at INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'success', 'failed')),
+			attempts INTEGER NOT NULL DEFAULT 0,
+			output TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			FOREIGN KEY (task_id) REFERENCES automatic_tasks(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS automatic_task_runs_task_idx ON automatic_task_runs(task_id, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS automatic_task_runs_status_idx ON automatic_task_runs(status, id)`,
 	}
 }
 
