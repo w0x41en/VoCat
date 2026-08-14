@@ -220,9 +220,10 @@ func TestEnforceCardRegionIgnoresUnknownOrNotReadySIM(t *testing.T) {
 
 func TestProvisionedDeviceTypeRecognizesNativeWWAN(t *testing.T) {
 	native := modem.Candidate{
-		USBPath:    "/sys/class/wwan/wwan0",
-		QMIControl: "/dev/wwan0qmi0",
-		ATPort:     modem.Port{Path: "/dev/wwan0at0"},
+		HardwareKind: "wwan",
+		USBPath:      "/sys/devices/pci0000:00/0000:00:00.0/wwan/wwan0",
+		QMIControl:   "/dev/wwan0qmi0",
+		ATPort:       modem.Port{Path: "/dev/wwan0at0"},
 	}
 	if got := provisionedDeviceType(native); got != store.DeviceTypeWiFi410 {
 		t.Fatalf("native WWAN type = %q, want %q", got, store.DeviceTypeWiFi410)
