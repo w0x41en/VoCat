@@ -71,12 +71,11 @@ func (manager *Manager) openNativeQMIRegistration(
 	return nas, nil
 }
 
-// startNativeQMIRegistrationReconcile mirrors VoHive's best-effort background
-// reconcile after a radio/VoWiFi teardown.  Bringing DMS online only proves
-// that the RF switch completed; NAS may still report searching or PS detached
-// seconds later, so the registration sequence must continue after SetFlight
-// has returned.  The per-device guard prevents repeated UI/poll callbacks from
-// opening competing QMI sessions.
+// startNativeQMIRegistrationReconcile continues registration after a radio
+// transition. Bringing DMS online only proves that the RF switch completed;
+// NAS may still report searching or PS detached seconds later, so the
+// registration sequence continues after SetFlight returns. The per-device
+// guard prevents repeated UI/poll callbacks from opening competing sessions.
 func (manager *Manager) startNativeQMIRegistrationReconcile(id string) bool {
 	if manager == nil {
 		return false
@@ -335,10 +334,9 @@ func ensureNativeQMIRegistrationForTarget(
 
 	if setAutomatic {
 		if err := session.SetSystemSelectionPreference(ctx, qmiSelectionAutomaticPreference()); err != nil {
-			// VoHive treats this as a best-effort policy update: some OpenStick
-			// firmware accepts the preference but reports an unsupported result
-			// for one of the optional NAS TLVs.  The explicit NAS register below
-			// remains the authoritative trigger.
+			// Some OpenStick firmware accepts the preference but reports an
+			// unsupported result for an optional NAS TLV. The explicit NAS register
+			// below remains the authoritative trigger.
 			if !isUnsupportedQMISelectionCommand(err) {
 				return fmt.Errorf("restore automatic QMI NAS selection: %w", err)
 			}

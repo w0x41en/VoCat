@@ -24,21 +24,21 @@ type Options struct {
 }
 
 type Manager struct {
-	mu                            sync.RWMutex
-	uiccMu                        sync.Mutex // serializes all multi-command UICC/APDU transactions
-	esimMu                        sync.Mutex // serializes eSIM card access (list/switch/download)
-	esimRecoveryMu                sync.Mutex
-	esimRecoveries                map[string]chan struct{}
-	esimCacheMu                   sync.RWMutex
-	esimCache                     map[string]EsimInfo
-	esimActiveName                map[string]string
-	discoverer                    modem.Discoverer
-	opener                        modem.Opener
-	commandTimeout                time.Duration
-	longTimeout                   time.Duration
-	smsTimeout                    time.Duration
-	scanTimeout                   time.Duration
-	cardReaders                   *pcsc.Service
+	mu             sync.RWMutex
+	uiccMu         sync.Mutex // serializes all multi-command UICC/APDU transactions
+	esimMu         sync.Mutex // serializes eSIM card access (list/switch/download)
+	esimRecoveryMu sync.Mutex
+	esimRecoveries map[string]chan struct{}
+	esimCacheMu    sync.RWMutex
+	esimCache      map[string]EsimInfo
+	discoverer     modem.Discoverer
+	opener         modem.Opener
+	commandTimeout time.Duration
+	longTimeout    time.Duration
+	smsTimeout     time.Duration
+	scanTimeout    time.Duration
+	cardReaders    *pcsc.Service
+
 	qmiRadioOpener                qmiRadioSessionOpener
 	nativeQMIRegistrationMu       sync.Mutex
 	nativeQMIRegistrationInFlight map[string]struct{}
@@ -112,19 +112,19 @@ func NewManager(options Options) (*Manager, error) {
 		options.CardReaders = pcsc.New()
 	}
 	return &Manager{
-		discoverer:                    options.Discoverer,
-		opener:                        options.Opener,
-		commandTimeout:                options.CommandTimeout,
-		longTimeout:                   options.LongTimeout,
-		smsTimeout:                    options.SMSTimeout,
-		scanTimeout:                   options.ScanTimeout,
-		cardReaders:                   options.CardReaders,
+		discoverer:     options.Discoverer,
+		opener:         options.Opener,
+		commandTimeout: options.CommandTimeout,
+		longTimeout:    options.LongTimeout,
+		smsTimeout:     options.SMSTimeout,
+		scanTimeout:    options.ScanTimeout,
+		cardReaders:    options.CardReaders,
+
 		qmiRadioOpener:                openQMIRadioSession,
 		devices:                       make(map[string]*managedDevice),
 		ussdSessions:                  make(map[string]ussdSession),
 		esimRecoveries:                make(map[string]chan struct{}),
 		esimCache:                     make(map[string]EsimInfo),
-		esimActiveName:                make(map[string]string),
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 	}, nil
 }
