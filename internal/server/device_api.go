@@ -1163,9 +1163,6 @@ func (s *Server) handleFlightMode(w http.ResponseWriter, r *http.Request, config
 			}
 		}
 	}
-	if !request.Enabled && result.Changed {
-		s.scheduleRadioRefresh(physicalID)
-	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": result})
 	return true
 }
@@ -1227,38 +1224,6 @@ func (s *Server) handleAPNProfiles(w http.ResponseWriter, r *http.Request, physi
 		"items": parseModemAPNProfiles(response.Lines),
 	}})
 	return true
-}
-
-// scheduleRadioRefresh follows a successful flight-mode exit until the modem
-// has had time to camp on a network. Overview SSE serves Manager's cached
-// snapshot, so without these refreshes the page can keep showing the pre-flight
-// operator indefinitely even though QMI DMS already brought the radio online.
-func (s *Server) scheduleRadioRefresh(id string) {
-	go func() {
-		const attempts = 10
-		for attempt := 0; attempt < attempts; attempt++ {
-			delay := 750 * time.Millisecond
-			if attempt > 0 {
-				delay = 3 * time.Second
-			}
-			timer := time.NewTimer(delay)
-			<-timer.C
-
-			entry, err := s.devices.Get(id)
-			if err != nil {
-				return
-			}
-			if entry.Snapshot != nil && entry.Snapshot.FlightMode {
-				return
-			}
-			refreshContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			snapshot, err := s.devices.Refresh(refreshContext, id)
-			cancel()
-			if err == nil && (snapshot.RegistrationStatus == 1 || snapshot.RegistrationStatus == 5) {
-				return
-			}
-		}
-	}()
 }
 
 func (s *Server) handleCellularData(

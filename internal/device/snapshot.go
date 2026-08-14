@@ -35,9 +35,7 @@ func (manager *Manager) readSnapshot(
 		return snapshot, fmt.Errorf("probe modem: %w", err)
 	}
 	snapshot.Responsive = true
-	var atiIMEI string
-	snapshot.Manufacturer, snapshot.Model, snapshot.Firmware, atiIMEI = parseATI(ati.Lines)
-	snapshot.IMEI = atiIMEI
+	snapshot.Manufacturer, snapshot.Model, snapshot.Firmware = parseATI(ati.Lines)
 	if snapshot.Model == "" && !strings.EqualFold(candidate.Product, "Android") {
 		snapshot.Model = candidate.Product
 	}
@@ -54,25 +52,14 @@ func (manager *Manager) readSnapshot(
 	if response, ok := optional("AT+CPIN?"); ok {
 		snapshot.SIMStatus, snapshot.SIMReady = parseCPIN(response)
 	}
-	var ccidErr error
-	for _, command := range []string{"AT+CCID", "AT+QCCID", "AT+ICCID"} {
-		var ccid modem.Response
-		ccid, ccidErr = manager.command(ctx, client, command)
-		if ccidErr != nil {
-			continue
-		}
-		snapshot.ICCID = parseICCIDIdentifier(
-			ccid,
-			[]string{"+CCID:", "+QCCID:", "+ICCID:", "ICCID:"},
-			18,
-			22,
-		)
-		if snapshot.ICCID != "" {
-			break
-		}
+	ccid, ccidErr := manager.command(ctx, client, "AT+CCID")
+	if ccidErr != nil {
+		ccid, ccidErr = manager.command(ctx, client, "AT+QCCID")
 	}
-	if snapshot.ICCID == "" && ccidErr != nil {
+	if ccidErr != nil {
 		snapshot.Warnings = append(snapshot.Warnings, "read ICCID: "+ccidErr.Error())
+	} else {
+		snapshot.ICCID = parseICCIDIdentifier(ccid, []string{"+CCID:", "+QCCID:"}, 18, 22)
 	}
 	previousICCID = strings.TrimSpace(previousICCID)
 	if previousICCID != "" && snapshot.ICCID != "" && !strings.EqualFold(previousICCID, snapshot.ICCID) {
@@ -166,37 +153,21 @@ func (manager *Manager) readSnapshot(
 			}
 		}
 	}
-	// Qualcomm/OpenStick firmware often leaves AT+QENG empty even while QMI
-	// NAS has the serving LTE tuple. Query the same native QMI session for
-	// band/channel, using it only as a native-path supplement.
-	nativeQMI, nativeQMIWarnings := manager.readNativeQMISnapshot(ctx, candidate)
-	if nativeQMI.accessTech != "" && snapshot.AccessTech == "" {
-		snapshot.AccessTech = nativeQMI.accessTech
-	}
-	if nativeQMI.band != "" {
-		snapshot.Band = nativeQMI.band
-	}
-	if nativeQMI.channel != "" {
-		snapshot.Channel = nativeQMI.channel
-	}
-	snapshot.Warnings = append(snapshot.Warnings, nativeQMIWarnings...)
 	if snapshot.RegistrationSource == "" && (snapshot.OperatorName != "" || snapshot.OperatorCode != "") {
 		// Older firmware can omit registration queries while COPS still proves
 		// that an operator is selected.
 		snapshot.RegistrationStatus = 1
 		snapshot.RegistrationSource = "COPS"
 	}
-	if snapshot.IMEI == "" {
-		response, ok := optional("AT+CGSN")
-		if ok {
-			snapshot.IMEI = parseIdentifier(
-				response,
-				[]string{"+CGSN:", "+GSN:"},
-				14,
-				17,
-			)
-		}
+	if response, ok := optional("AT+CGSN"); ok {
+		snapshot.IMEI = parseIdentifier(
+			response,
+			[]string{"+CGSN:", "+GSN:"},
+			14,
+			17,
+		)
 	}
+
 	if response, ok := optional("AT+CFUN?"); ok {
 		if mode, found := parseCFUN(response); found {
 			snapshot.OperatingMode = mode
@@ -364,20 +335,13 @@ func parseRegistrationStatus(response modem.Response) (int, bool) {
 	return 0, false
 }
 
-func parseATI(lines []string) (manufacturer, model, firmware, imei string) {
+func parseATI(lines []string) (manufacturer, model, firmware string) {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		upper := strings.ToUpper(line)
 		switch {
-		case strings.HasPrefix(upper, "MANUFACTURER:"):
-			manufacturer = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		case strings.HasPrefix(upper, "MODEL:"):
-			model = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		case strings.HasPrefix(upper, "REVISION:"):
 			firmware = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		case strings.HasPrefix(upper, "IMEI:"):
-			response := modem.Response{Lines: []string{line}}
-			imei = parseIdentifier(response, []string{"IMEI:"}, 14, 17)
 		case strings.Contains(upper, "QUECTEL"):
 			manufacturer = line
 		case strings.HasPrefix(upper, "EC20") || strings.HasPrefix(upper, "EC25"):

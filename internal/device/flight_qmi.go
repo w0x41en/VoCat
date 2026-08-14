@@ -18,15 +18,6 @@ type qmiRadioSession interface {
 	Close() error
 }
 
-// qmiNativeSnapshotSession is the optional QMI data surface used by native
-// WWAN devices for fields that Qualcomm firmware does not expose through the
-// AT port.  Keep it separate from qmiRadioSession so transcript-backed and
-// AT-only devices do not need to implement these queries.
-type qmiNativeSnapshotSession interface {
-	qmiRadioSession
-	GetRFBandInfo(context.Context) (*qmi.RFBandInfo, error)
-	GetCellLocationInfo(context.Context) (*qmi.CellLocationInfo, error)
-}
 type qmiRadioSessionOpener func(context.Context, string) (qmiRadioSession, error)
 
 // nativeQMIControl identifies the QMI control node exposed by native WWAN
@@ -161,22 +152,6 @@ func openQMIRadioSession(ctx context.Context, controlDevice string) (qmiRadioSes
 
 func (session *productionQMIRadioSession) GetOperatingMode(ctx context.Context) (qmi.OperatingMode, error) {
 	return session.dms.GetOperatingMode(ctx)
-}
-
-func (session *productionQMIRadioSession) GetRFBandInfo(ctx context.Context) (*qmi.RFBandInfo, error) {
-	nas, err := session.nasService()
-	if err != nil {
-		return nil, err
-	}
-	return nas.GetRFBandInfo(ctx)
-}
-
-func (session *productionQMIRadioSession) GetCellLocationInfo(ctx context.Context) (*qmi.CellLocationInfo, error) {
-	nas, err := session.nasService()
-	if err != nil {
-		return nil, err
-	}
-	return nas.GetCellLocationInfo(ctx)
 }
 
 func (session *productionQMIRadioSession) SetOperatingMode(ctx context.Context, mode qmi.OperatingMode) error {
