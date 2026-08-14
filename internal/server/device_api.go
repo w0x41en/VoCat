@@ -2009,7 +2009,6 @@ func modemSummary(snapshot *device.Snapshot, phone string, phoneSource string) m
 		"operating_mode":            snapshot.OperatingMode,
 		"phone_number":              phone,
 		"phone_number_source":       phoneSource,
-		"phone_number_status":       phoneStatus(snapshot),
 	}
 }
 
@@ -2027,13 +2026,6 @@ func snapshotHasSIM(snapshot *device.Snapshot) bool {
 		// PIN/PUK and other explicit UICC states prove that a card is present.
 		return true
 	}
-}
-
-func phoneStatus(snapshot *device.Snapshot) string {
-	if snapshot == nil {
-		return ""
-	}
-	return snapshot.Phone.Status
 }
 
 func idleVoWiFiRuntime(id string, snapshot *device.Snapshot) map[string]any {

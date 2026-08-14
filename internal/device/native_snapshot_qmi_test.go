@@ -1,7 +1,6 @@
 package device
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
@@ -37,14 +36,5 @@ func TestQMINativeNetworkMetricsFallbackToCellLocation(t *testing.T) {
 	)
 	if accessTech != "LTE" || band != "B3" || channel != "1600" {
 		t.Fatalf("cell metrics = %q/%q/%q, want LTE/B3/1600", accessTech, band, channel)
-	}
-}
-
-func TestIsQMINotProvisioned(t *testing.T) {
-	if !isQMINotProvisioned(&qmi.QMIError{ErrorCode: qmiErrorNotProvisioned}) {
-		t.Fatal("NotProvisioned QMI error was not recognized")
-	}
-	if isQMINotProvisioned(errors.New("temporary modem failure")) {
-		t.Fatal("ordinary error was classified as NotProvisioned")
 	}
 }

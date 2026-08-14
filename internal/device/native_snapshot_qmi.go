@@ -17,14 +17,12 @@ type qmiNativeSnapshotData struct {
 	accessTech string
 	band       string
 	channel    string
-	phone      PhoneNumber
-	phoneErr   error
 }
 
-// readNativeQMISnapshot opens one QMI session and reads both the active RF
-// tuple and DMS MSISDN.  Keeping the session scoped to one refresh avoids
-// racing qmicli/AT refreshes while still leaving all existing optional QMI
-// fakes and non-native modem paths untouched.
+// readNativeQMISnapshot opens one QMI session and reads the active RF tuple.
+// Keeping the session scoped to one refresh avoids racing qmicli/AT refreshes
+// while leaving all existing optional QMI fakes and non-native modem paths
+// untouched.
 func (manager *Manager) readNativeQMISnapshot(
 	ctx context.Context,
 	candidate modem.Candidate,
@@ -47,19 +45,6 @@ func (manager *Manager) readNativeQMISnapshot(
 
 	data := qmiNativeSnapshotData{}
 	var warnings []string
-	if raw, err := native.GetMSISDN(queryContext); err != nil {
-		data.phoneErr = err
-		if !isQMINotProvisioned(err) {
-			warnings = append(warnings, "read QMI DMS MSISDN: "+err.Error())
-		}
-	} else if number := normalizePhoneNumber(raw); number != "" {
-		data.phone = PhoneNumber{
-			Number: number,
-			Source: PhoneSourceQMIDMSMSISDN,
-			Status: "号码来自 QMI DMS MSISDN",
-		}
-	}
-
 	var bandInfo *qmi.RFBandInfo
 	if info, err := native.GetRFBandInfo(queryContext); err == nil {
 		bandInfo = info
@@ -235,11 +220,4 @@ func lteBandFromEARFCN(earfcn uint16) string {
 	default:
 		return ""
 	}
-}
-
-const qmiErrorNotProvisioned uint16 = 0x0010
-
-func isQMINotProvisioned(err error) bool {
-	qmiErr := qmi.GetQMIError(err)
-	return qmiErr != nil && qmiErr.ErrorCode == qmiErrorNotProvisioned
 }

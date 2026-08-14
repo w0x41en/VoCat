@@ -25,7 +25,6 @@ type qmiRadioSession interface {
 // AT-only devices do not need to implement these queries.
 type qmiNativeSnapshotSession interface {
 	qmiRadioSession
-	GetMSISDN(context.Context) (string, error)
 	GetRFBandInfo(context.Context) (*qmi.RFBandInfo, error)
 	GetCellLocationInfo(context.Context) (*qmi.CellLocationInfo, error)
 }
@@ -169,17 +168,6 @@ func (session *productionQMIRadioSession) GetOperatingMode(ctx context.Context) 
 	return session.dms.GetOperatingMode(ctx)
 }
 
-func (session *productionQMIRadioSession) GetICCID(ctx context.Context) (string, error) {
-	return session.dms.GetICCID(ctx)
-}
-
-func (session *productionQMIRadioSession) GetMSISDN(ctx context.Context) (string, error) {
-	if session == nil || session.dms == nil {
-		return "", errors.New("QMI DMS session is unavailable")
-	}
-	return session.dms.GetMSISDN(ctx)
-}
-
 func (session *productionQMIRadioSession) GetRFBandInfo(ctx context.Context) (*qmi.RFBandInfo, error) {
 	nas, err := session.nasService()
 	if err != nil {
@@ -295,10 +283,9 @@ func (manager *Manager) setNativeQMIFlight(
 	currentRadioOff := isQMIRadioOffMode(currentQMI)
 	manager.updateSnapshotMode(id, state, current)
 	if !enabled && !currentRadioOff {
-		// DMS Online is only the radio half of the recovery. VoHive continues
-		// with a background NAS registration/PS-attach reconcile after the
-		// flight-mode transition; do the same without holding the radio QMI
-		// session open or delaying the control-plane response.
+		// DMS Online is only the radio half of the recovery. Continue with a
+		// background NAS registration/PS-attach reconcile after the flight-mode
+		// transition without holding the radio QMI session open.
 		manager.startNativeQMIRegistrationReconcile(id)
 	}
 	return FlightResult{
