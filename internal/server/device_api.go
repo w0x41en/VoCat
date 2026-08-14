@@ -56,10 +56,6 @@ type DeviceController interface {
 	ESIMChipInfo(context.Context, string) (*device.EsimChipInfo, error)
 }
 
-type activeESIMProfileReader interface {
-	ActiveESIMProfileName(string) string
-}
-
 type deviceConfigPayload struct {
 	ID                 string `json:"id"`
 	Name               string `json:"name"`
@@ -1598,7 +1594,6 @@ func (s *Server) configuredDeviceSummary(
 				if modemStatus, ok := result["modem"].(map[string]any); ok {
 					modemStatus["phone_number"] = association.Number
 					modemStatus["phone_number_source"] = association.Source
-					modemStatus["phone_number_status"] = "号码来自按 ICCID 保存的 IMS/VoWiFi 注册关联"
 				}
 			}
 		}

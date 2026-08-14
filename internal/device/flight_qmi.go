@@ -209,6 +209,10 @@ func (session *productionQMIRadioSession) Close() error {
 		closeErrors = append(closeErrors, session.dms.Close())
 		session.dms = nil
 	}
+	if session.nas != nil {
+		closeErrors = append(closeErrors, session.nas.Close())
+		session.nas = nil
+	}
 	if session.client != nil {
 		closeErrors = append(closeErrors, session.client.Close())
 		session.client = nil
