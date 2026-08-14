@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,11 +40,7 @@ func (manager *Manager) nativeQMIControl(id string) (string, bool, error) {
 	candidate := manager.candidateFor(state)
 	controlDevice := strings.TrimSpace(candidate.QMIControl)
 	deviceID := strings.TrimSpace(candidate.ID)
-	if controlDevice == "" || deviceID == "" || !strings.HasPrefix(deviceID, "wwan") {
-		return "", false, nil
-	}
-	base := filepath.Base(controlDevice)
-	if !strings.HasPrefix(base, deviceID+"qmi") {
+	if !nativeQMIControlMatches(deviceID, controlDevice) {
 		return "", false, nil
 	}
 	return controlDevice, true, nil

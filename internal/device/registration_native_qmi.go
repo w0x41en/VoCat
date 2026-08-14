@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,14 +39,25 @@ const (
 func isNativeQMICandidate(candidate modem.Candidate) bool {
 	deviceID := strings.TrimSpace(candidate.ID)
 	control := strings.TrimSpace(candidate.QMIControl)
-	if deviceID == "" || control == "" || !strings.HasPrefix(deviceID, "wwan") {
+	return nativeQMIControlMatches(deviceID, control)
+}
+
+func nativeQMIControlMatches(deviceID, control string) bool {
+	deviceID = strings.TrimSpace(deviceID)
+	control = strings.TrimSpace(control)
+	if deviceID == "" || control == "" {
 		return false
 	}
-	base := strings.TrimSpace(control)
-	if slash := strings.LastIndexByte(base, '/'); slash >= 0 {
-		base = base[slash+1:]
+	prefix := ""
+	switch {
+	case strings.HasPrefix(deviceID, "wwan"):
+		prefix = deviceID + "qmi"
+	case strings.HasPrefix(deviceID, "mhi-wwan"):
+		prefix = "wwan" + strings.TrimPrefix(deviceID, "mhi-wwan") + "qmi"
+	default:
+		return false
 	}
-	return strings.HasPrefix(base, deviceID+"qmi")
+	return strings.HasPrefix(filepath.Base(control), prefix)
 }
 
 func (manager *Manager) openNativeQMIRegistration(

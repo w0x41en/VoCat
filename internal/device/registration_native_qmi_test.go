@@ -189,6 +189,14 @@ func TestIsNativeQMICandidateRequiresOpenStickWWANPair(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "mhi native discovery id",
+			candidate: modem.Candidate{
+				ID:         "mhi-wwan0",
+				QMIControl: "/dev/wwan0qmi0",
+			},
+			want: true,
+		},
+		{
 			name: "different control device",
 			candidate: modem.Candidate{
 				ID:         "wwan0",
