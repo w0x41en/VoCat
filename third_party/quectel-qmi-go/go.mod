@@ -1,3 +1,5 @@
+// Vendored from https://github.com/cm9vdA/quectel-qmi-go at
+// a513430381a33f493e32f7bb7b96e2450a403643; see NOTICE for licensing status.
 module github.com/iniwex5/quectel-qmi-go
 
 go 1.25.0
