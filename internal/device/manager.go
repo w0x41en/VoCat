@@ -121,13 +121,13 @@ func NewManager(options Options) (*Manager, error) {
 		scanTimeout:    options.ScanTimeout,
 		cardReaders:    options.CardReaders,
 
-		qmiRadioOpener: openQMIRadioSession,
-
-		devices:                       make(map[string]*managedDevice),
-		ussdSessions:                  make(map[string]ussdSession),
-		esimRecoveries:                make(map[string]chan struct{}),
-		esimCache:                     make(map[string]EsimInfo),
+		qmiRadioOpener:                openQMIRadioSession,
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
+
+		devices:        make(map[string]*managedDevice),
+		ussdSessions:   make(map[string]ussdSession),
+		esimRecoveries: make(map[string]chan struct{}),
+		esimCache:      make(map[string]EsimInfo),
 	}, nil
 }
 
