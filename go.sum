@@ -1,3 +1,5 @@
+github.com/GooWen/quectel-qmi-go v0.0.0-20260629135427-aaada14395c1 h1:qKCYCqLA8Rjg01wKCWVzMhZdmn3BdNT4WuGzlHMSHk0=
+github.com/GooWen/quectel-qmi-go v0.0.0-20260629135427-aaada14395c1/go.mod h1:6AlSY+Yj4MqJOsZ8cNrq99AzT9MlaopADnJtSRiyAfE=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/creack/goselect v0.1.2 h1:2DNy14+JPjRBgPzAd1thbQp4BSIihxcBf0IXhQXDRa0=
@@ -11,8 +13,6 @@ github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e h1:ijClszYn+mADRFY17k
 github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e/go.mod h1:boTsfXsheKC2y+lKOCMpSfarhxDeIzfZG1jqGcPl3cA=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/iniwex5/quectel-qmi-go v0.6.0 h1:zWZc9jeNMy7+USFRBbfdShnjzSryyYnCw7NPw4ubaIg=
-github.com/iniwex5/quectel-qmi-go v0.6.0/go.mod h1:6AlSY+Yj4MqJOsZ8cNrq99AzT9MlaopADnJtSRiyAfE=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
 github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
