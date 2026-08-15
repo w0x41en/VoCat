@@ -1,7 +1,3 @@
-github.com/ElMostafaIdrassi/goscard v1.0.0 h1:RDG5QrqrQBUoi5MkzM4zILdYf8qDn62daYZszqvdgx0=
-github.com/ElMostafaIdrassi/goscard v1.0.0/go.mod h1:uGOakQe2fFlW2cVlr9cv6x07uelrf0j0aKPbR7jGgfg=
-github.com/GooWen/quectel-qmi-go v0.0.0-20260614143133-a513430381a3 h1:jsuJeIGcsgjB9eDeBU1E3exiJHR3UaamwcUdOFVyt04=
-github.com/GooWen/quectel-qmi-go v0.0.0-20260614143133-a513430381a3/go.mod h1:6AlSY+Yj4MqJOsZ8cNrq99AzT9MlaopADnJtSRiyAfE=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/creack/goselect v0.1.2 h1:2DNy14+JPjRBgPzAd1thbQp4BSIihxcBf0IXhQXDRa0=
@@ -34,6 +30,10 @@ github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOf
 github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
 github.com/vishvananda/netns v0.0.5 h1:DfiHV+j8bA32MFM7bfEunvT8IAqQ/NzSJHtcmW5zdEY=
 github.com/vishvananda/netns v0.0.5/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
+github.com/w0x41en/quectel-qmi-go v0.6.0-vocat.1 h1:4OobxKHG2qZuMxL0WX3W7FdMwqha4zMRfwjvpeXY7Zk=
+github.com/w0x41en/quectel-qmi-go v0.6.0-vocat.1/go.mod h1:L3vHuv1EeKKXo5Ngu/GC+ryyRNliKhhlEBWATTb1WgA=
+github.com/w0x41en/quectel-qmi-go v0.6.0-vocat.1.0.20260815135133-db2fd74ef01e h1:ue5W8V15LrvAC6ZVEWYSZZHQKm0YS5xmfKZTnaeETUE=
+github.com/w0x41en/quectel-qmi-go v0.6.0-vocat.1.0.20260815135133-db2fd74ef01e/go.mod h1:L3vHuv1EeKKXo5Ngu/GC+ryyRNliKhhlEBWATTb1WgA=
 github.com/warthog618/sms v0.3.0 h1:LYAb5ngmu2qjNExgji3B7xi2tIZ9+DsuE9pC5xs4wwc=
 github.com/warthog618/sms v0.3.0/go.mod h1:+bYZGeBxu003sxD5xhzsrIPBAjPBzTABsRTwSpd7ld4=
 go.bug.st/serial v1.6.4 h1:7FmqNPgVp3pu2Jz5PoPtbZ9jJO5gnEnZIvnI1lzve8A=

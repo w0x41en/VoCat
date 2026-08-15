@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/qmiport"
 )
@@ -600,6 +600,26 @@ func isQMIWMSContextFailure(err error) bool {
 		(qmiErr.ErrorCode == qmiWMSInvalidArgCode || qmiErr.ErrorCode == qmiWMSCardCallControlCode)
 }
 
+// isQMIWMSListTagUnsupported identifies modem implementations that reject a
+// particular List Messages tag without invalidating the WMS context.  The
+// OpenStick 410 returns OP_DEVICE_UNSUPPORTED for the MT-read tag and
+// INVALID_ARG for the MO tags.  Those tags are optional for inbound SMS
+// reception; treating them as a context failure discards already-collected
+// inbound records and unnecessarily switches the whole scan to AT fallback.
+func isQMIWMSListTagUnsupported(err error, tag qmi.MessageTagType) bool {
+	qmiErr := qmi.GetQMIError(err)
+	if qmiErr == nil || qmiErr.Service != qmi.ServiceWMS ||
+		qmiErr.MessageID != qmi.WMSListMessages {
+		return false
+	}
+	if qmiErr.ErrorCode == qmi.QMIErrOpDeviceUnsupported {
+		return tag == qmi.TagTypeMTRead ||
+			tag == qmi.TagTypeMONotSent || tag == qmi.TagTypeMOSent
+	}
+	return qmiErr.ErrorCode == qmiWMSInvalidArgCode &&
+		(tag == qmi.TagTypeMONotSent || tag == qmi.TagTypeMOSent)
+}
+
 // qmiErrorLogAttrs preserves the raw QMI result/error identifiers in the
 // persisted event stream. Serializing an error interface alone can become an
 // empty JSON object in loghub, which would hide whether the modem returned
@@ -1091,6 +1111,20 @@ func (manager *Manager) listSMSQMILockedAttempt(
 				}
 			}
 			if listErr != nil {
+				if isQMIWMSListTagUnsupported(listErr, requestedTag) {
+					unsupportedAttrs := []any{
+						"category", "sms", "event", "qmi_wms_list_tag_unsupported",
+						"control_path", controlDevice, "storage", storage.name,
+						"tag", requestedTag,
+					}
+					unsupportedAttrs = append(unsupportedAttrs, qmiErrorLogAttrs(listErr)...)
+					manager.logEvent(slog.LevelInfo, "QMI WMS list tag unsupported",
+						unsupportedAttrs...)
+					// Do not mark the storage incomplete: the supported inbound
+					// tags may already have produced records, and an unsupported
+					// optional tag must not force AT fallback for the whole scan.
+					continue
+				}
 				if isQMIWMSContextFailure(listErr) {
 					if !checkedNVRoute {
 						checkedNVRoute = true

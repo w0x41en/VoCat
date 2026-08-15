@@ -5,15 +5,13 @@ go 1.25.0
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/iniwex5/netlink v1.3.3
-	github.com/iniwex5/quectel-qmi-go v0.0.0
+	github.com/w0x41en/quectel-qmi-go v0.6.0-vocat.1.0.20260815135133-db2fd74ef01e
 	go.bug.st/serial v1.6.4
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.43.0
 	modernc.org/sqlite v1.38.2
 )
-
-replace github.com/iniwex5/quectel-qmi-go => ./third_party/quectel-qmi-go
 
 require (
 	github.com/creack/goselect v0.1.2 // indirect

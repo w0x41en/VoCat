@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/modem"
 )
@@ -228,6 +228,40 @@ func TestQMIWMSContextErrorCodeClassification(t *testing.T) {
 	otherService.Service = qmi.ServiceUIM
 	if isQMIWMSContextFailure(&otherService) {
 		t.Fatal("an INVALID_ARG from another QMI service must not trigger WMS recovery")
+	}
+}
+
+func TestQMIWMSUnsupportedListTagClassification(t *testing.T) {
+	unsupported := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		ErrorCode: qmi.QMIErrOpDeviceUnsupported,
+	}
+	if !isQMIWMSListTagUnsupported(unsupported, qmi.TagTypeMTRead) {
+		t.Fatal("OP_DEVICE_UNSUPPORTED must be non-fatal for an unsupported WMS list tag")
+	}
+	if isQMIWMSListTagUnsupported(unsupported, qmi.TagTypeMTNotRead) {
+		t.Fatal("OP_DEVICE_UNSUPPORTED on the inbound-unread tag must remain recoverable")
+	}
+
+	invalidArgument := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		ErrorCode: qmi.QMIErrInvalidArg,
+	}
+	if !isQMIWMSListTagUnsupported(invalidArgument, qmi.TagTypeMONotSent) ||
+		!isQMIWMSListTagUnsupported(invalidArgument, qmi.TagTypeMOSent) {
+		t.Fatal("INVALID_ARG must be non-fatal for unsupported MO list tags")
+	}
+	if isQMIWMSListTagUnsupported(invalidArgument, qmi.TagTypeMTNotRead) ||
+		isQMIWMSListTagUnsupported(invalidArgument, qmi.TagTypeMTRead) {
+		t.Fatal("INVALID_ARG for an inbound tag must remain a WMS context failure")
+	}
+
+	otherService := *unsupported
+	otherService.Service = qmi.ServiceUIM
+	if isQMIWMSListTagUnsupported(&otherService, qmi.TagTypeMTRead) {
+		t.Fatal("an unsupported operation from another QMI service must not match")
 	}
 }
 
@@ -668,6 +702,54 @@ func TestNativeQMIListScansUIMAndNVWithTagMetadata(t *testing.T) {
 	}
 	if len(session.calls) < 2 || session.calls[0] != "get-iccid" || session.calls[1] != "get-imsi" {
 		t.Fatalf("calls = %v", session.calls)
+	}
+}
+
+func TestNativeQMIListPreservesInboundRecordsWhenOptionalTagsAreUnsupported(t *testing.T) {
+	manager, atOpener, id := newStartedNativeSMSManager(t)
+	deliverPDU := "000405912143F500004210203040500005C82293F904"
+	deliverRaw, _ := hex.DecodeString(deliverPDU)
+	unsupportedRead := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		Result:    1,
+		ErrorCode: qmi.QMIErrOpDeviceUnsupported,
+	}
+	unsupportedMO := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		Result:    1,
+		ErrorCode: qmi.QMIErrInvalidArg,
+	}
+	session := &fakeQMISMSSession{
+		iccid: "8986001234567890123",
+		imsi:  "515031234567890",
+		lists: map[fakeQMISMSListKey][]qmiSMSListEntry{
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMTNotRead}: {{Index: 9, Tag: qmi.TagTypeMTNotRead}},
+		},
+		listErrs: map[fakeQMISMSListKey]error{
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMTRead}:    unsupportedRead,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMTRead}:     unsupportedRead,
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMONotSent}: unsupportedMO,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMONotSent}:  unsupportedMO,
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMOSent}:    unsupportedMO,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMOSent}:     unsupportedMO,
+		},
+		reads: map[fakeQMISMSReadKey][]byte{
+			{storage: qmiSMSStorageNV, index: 9}: deliverRaw,
+		},
+	}
+	manager.qmiSMSOpener = func(context.Context, string) (qmiSMSSession, error) {
+		return session, nil
+	}
+
+	scan, err := manager.ListSMSBoundSubscriber(context.Background(), id)
+	if err != nil || scan.Transport != SMSTransportCellularQMI || len(scan.Messages) != 1 ||
+		scan.Messages[0].Text != "HELLO" || !reflect.DeepEqual(scan.Storages, []string{"SM", "ME"}) {
+		t.Fatalf("inbound scan = (%#v, %v)", scan, err)
+	}
+	if atOpener.openCount != 0 {
+		t.Fatalf("unsupported optional tags must not force AT fallback; opens=%d", atOpener.openCount)
 	}
 }
 
