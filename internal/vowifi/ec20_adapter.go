@@ -54,6 +54,10 @@ type EC20NativeICCIDReader interface {
 	ReadNativeQMIICCID(context.Context, string) (string, error)
 }
 
+type EC20NativeIMEIReader interface {
+	ReadNativeQMIIMEI(context.Context, string) (string, error)
+}
+
 type EC20UICCLocker interface {
 	LockUICC()
 	UnlockUICC()
@@ -155,11 +159,17 @@ func (adapter *EC20Adapter) ReadIdentity(
 		return SIMIdentity{}, err
 	}
 
-	imeiResponse, err := adapter.execute(ctx, deviceID, "AT+CGSN")
-	if err != nil {
-		return SIMIdentity{}, fmt.Errorf("read EC20 IMEI: %w", err)
+	var imei string
+	if reader, ok := adapter.executor.(EC20NativeIMEIReader); ok {
+		imei, err = reader.ReadNativeQMIIMEI(ctx, deviceID)
 	}
-	imei := digitIdentifier(imeiResponse, []string{"+CGSN:", "+GSN:"}, 14, 17)
+	if imei == "" {
+		imeiResponse, atErr := adapter.execute(ctx, deviceID, "AT+CGSN")
+		if atErr != nil {
+			return SIMIdentity{}, fmt.Errorf("read EC20 IMEI: %w", atErr)
+		}
+		imei = digitIdentifier(imeiResponse, []string{"+CGSN:", "+GSN:"}, 14, 17)
+	}
 	if imei == "" {
 		return SIMIdentity{}, errors.New("vocat: EC20 returned no valid IMEI")
 	}

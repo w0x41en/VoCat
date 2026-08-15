@@ -242,6 +242,35 @@ func TestManagerRefreshReadsNativeWWANICCIDThroughQMIUIM(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestManagerReadsNativeWWANIMEIThroughQMIDMS(t *testing.T) {
+	manager, err := NewManager(Options{
+		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
+			ID:               "mhi-wwan0",
+			QMIControl:       "/dev/wwan0qmi0",
+			NetworkInterface: "wwan0",
+		}}},
+		Opener: &staticOpener{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return &fakeQMIRadioSession{imei: "866340055929387"}, nil
+	}
+
+	got, err := manager.ReadNativeQMIIMEI(context.Background(), "mhi-wwan0")
+	if err != nil {
+		t.Fatalf("ReadNativeQMIIMEI: %v", err)
+	}
+	if got != "866340055929387" {
+		t.Fatalf("IMEI = %q", got)
+	}
+}
+
 func TestParseSPNASCIIAndUCS2(t *testing.T) {
 	if got := parseSPN(okResponse(`+CRSM: 144,0,"004C6562617261FFFFFFFFFFFFFFFFFFFF"`)); got != "Lebara" {
 		t.Fatalf("ASCII SPN = %q", got)

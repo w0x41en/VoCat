@@ -37,6 +37,10 @@ type nativeQMIICCIDSession interface {
 	GetICCID(context.Context) (string, error)
 }
 
+type nativeQMIIMEISession interface {
+	GetIMEI(context.Context) (string, error)
+}
+
 // nativeQMIControl identifies the QMI control node exposed by native WWAN
 // devices. USB serial modems may also advertise a control path, but only the
 // wwanN/qmiN pairing is safe to operate through the native QMI path.
@@ -188,6 +192,20 @@ func (session *productionQMIRadioSession) GetICCID(ctx context.Context) (string,
 		session.uim = uim
 	}
 	return session.uim.GetICCID(ctx)
+}
+
+func (session *productionQMIRadioSession) GetIMEI(ctx context.Context) (string, error) {
+	if session == nil || session.dms == nil {
+		return "", errors.New("QMI DMS session is unavailable")
+	}
+	serials, err := session.dms.GetDeviceSerialNumbers(ctx)
+	if err != nil {
+		return "", err
+	}
+	if serials == nil || strings.TrimSpace(serials.IMEI) == "" {
+		return "", errors.New("QMI DMS returned no IMEI")
+	}
+	return serials.IMEI, nil
 }
 
 func (session *productionQMIRadioSession) GetMSISDN(ctx context.Context) (string, error) {

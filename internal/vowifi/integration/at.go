@@ -33,6 +33,10 @@ type nativeICCIDReader interface {
 	ReadNativeQMIICCID(context.Context, string) (string, error)
 }
 
+type nativeIMEIReader interface {
+	ReadNativeQMIIMEI(context.Context, string) (string, error)
+}
+
 func (mapper ATMapper) LockUICC() {
 	if locker, ok := mapper.Devices.(uiccLocker); ok {
 		locker.LockUICC()
@@ -94,6 +98,21 @@ func (mapper ATMapper) ReadNativeQMIICCID(
 		return "", err
 	}
 	return reader.ReadNativeQMIICCID(ctx, physicalID)
+}
+
+func (mapper ATMapper) ReadNativeQMIIMEI(
+	ctx context.Context,
+	configuredID string,
+) (string, error) {
+	reader, ok := mapper.Devices.(nativeIMEIReader)
+	if !ok {
+		return "", errors.New("native QMI IMEI reader is unavailable")
+	}
+	physicalID, err := mapper.resolve(ctx, configuredID)
+	if err != nil {
+		return "", err
+	}
+	return reader.ReadNativeQMIIMEI(ctx, physicalID)
 }
 
 func (mapper ATMapper) resolve(
