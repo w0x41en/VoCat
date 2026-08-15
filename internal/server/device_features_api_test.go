@@ -117,6 +117,30 @@ func TestPhysicalMatchesConfigRejectsDuplicateAndroidSerialAlias(t *testing.T) {
 	}
 }
 
+func TestPhysicalMatchesConfigUsesNativeQMIControlWhenSysfsPathDiffers(t *testing.T) {
+	config := store.Device{
+		ID:            "wwan0",
+		Interface:     "wwan0",
+		ControlDevice: "/dev/wwan0qmi0",
+		ATPort:        "/dev/wwan0at0",
+		USBPath:       "/sys/class/wwan/wwan0",
+		DeviceBackend: "qmi",
+	}
+	entry := device.Device{
+		ID: "mhi-wwan0",
+		Candidate: modem.Candidate{
+			HardwareKind:     "wwan",
+			QMIControl:       "/dev/wwan0qmi0",
+			NetworkInterface: "wwan0",
+			USBPath:          "/sys/devices/platform/soc/4080000.remoteproc/wwan/wwan0",
+			ATPort:           modem.Port{Path: "/dev/wwan0at0"},
+		},
+	}
+	if !physicalMatchesConfig(entry, config) {
+		t.Fatal("native WWAN should match by its exact QMI control node despite sysfs path presentation")
+	}
+}
+
 func TestFindDiscoveredDevicePrefersPhysicalIdentityOverSerialAlias(t *testing.T) {
 	alias := "/dev/serial/by-id/usb-Android_Android-if02-port0"
 	devices := []device.Device{

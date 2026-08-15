@@ -1502,6 +1502,16 @@ func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 	if entry.ID == config.ID {
 		return true
 	}
+	// Native WWAN discovery uses a stable QMI control node as the strongest
+	// identity.  OpenStick exposes the configured interface through
+	// /sys/class/wwan/wwanN while discovery resolves it to the underlying
+	// /sys/devices/... path, so the two USB paths are expected to differ.  Check
+	// the exact QMI pair before comparing those presentation paths.
+	if candidate.HardwareKind == "wwan" &&
+		config.Interface != "" && config.Interface == candidate.NetworkInterface &&
+		config.ControlDevice != "" && config.ControlDevice == candidate.QMIControl {
+		return true
+	}
 	if config.ModemIMEI != "" && entry.Snapshot != nil && entry.Snapshot.IMEI != "" {
 		return config.ModemIMEI == entry.Snapshot.IMEI
 	}
@@ -1512,9 +1522,6 @@ func physicalMatchesConfig(entry device.Device, config store.Device) bool {
 	// only legacy fallbacks when no physical USB path or readable IMEI exists.
 	if config.ATPort != "" &&
 		(config.ATPort == candidate.ATPort.Path || config.ATPort == candidate.ATPort.OpenPath()) {
-		return true
-	}
-	if config.ControlDevice != "" && config.ControlDevice == candidate.QMIControl {
 		return true
 	}
 	return false
