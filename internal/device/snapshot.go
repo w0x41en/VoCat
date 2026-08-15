@@ -66,6 +66,17 @@ func (manager *Manager) readSnapshot(
 			break
 		}
 	}
+	if snapshot.ICCID == "" && isNativeQMICandidate(candidate) {
+		qmiContext, cancelQMI := manager.withTimeout(ctx, manager.commandTimeout*5)
+		qmiICCID, qmiErr := manager.readNativeQMIICCID(qmiContext, candidate)
+		cancelQMI()
+		if qmiErr == nil {
+			snapshot.ICCID = qmiICCID
+			ccidErr = nil
+		} else {
+			snapshot.Warnings = append(snapshot.Warnings, "read ICCID via QMI UIM: "+qmiErr.Error())
+		}
+	}
 	if snapshot.ICCID == "" && ccidErr != nil {
 		snapshot.Warnings = append(snapshot.Warnings, "read ICCID: "+ccidErr.Error())
 	}

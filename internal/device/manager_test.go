@@ -187,6 +187,61 @@ func TestManagerRefreshBuildsNativeWWANSnapshotFromQualcommATI(t *testing.T) {
 	client.assertDone(t)
 }
 
+func TestManagerRefreshReadsNativeWWANICCIDThroughQMIUIM(t *testing.T) {
+	client := &transcriptClient{steps: []clientStep{
+		{command: "ATI", response: okResponse(
+			"Manufacturer: QUALCOMM INCORPORATED",
+			"Model: 4094",
+			"Revision: MPSS.DPM.2.0",
+			"IMEI: 866340055929387",
+		)},
+		{command: "AT+CPIN?", response: okResponse("+CPIN: READY")},
+		{command: "AT+CCID", err: errors.New("CCID unsupported")},
+		{command: "AT+QCCID", err: errors.New("QCCID unsupported")},
+		{command: "AT+ICCID", err: errors.New("ICCID unsupported")},
+		{command: "AT+CIMI", response: okResponse("234159611274418")},
+		{command: "AT+CRSM=176,28486,0,0,17", err: errors.New("SPN unsupported")},
+		{command: "AT+CRSM=192,28589,0,0,0", err: errors.New("MNC length unsupported")},
+		{command: "AT+CRSM=192,28478,0,0,0", err: errors.New("GID1 unsupported")},
+		{command: "AT+CRSM=192,28479,0,0,0", err: errors.New("GID2 unsupported")},
+		{command: "AT+CSQ", response: okResponse("+CSQ: 99,99")},
+		{command: `AT+QENG="servingcell"`, response: okResponse(`+QENG: "servingcell","SEARCH"`)},
+		{command: "AT+COPS?", response: okResponse("+COPS: 0")},
+		{command: "AT+CEREG?", response: okResponse("+CEREG: 0,2")},
+		{command: "AT+CFUN?", response: okResponse("+CFUN: 1")},
+		{command: "AT+CNUM", response: okResponse(`+CNUM: "","+8613800138000",145`)},
+	}}
+	manager, err := NewManager(Options{
+		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
+			ID:               "wwan0",
+			Product:          "OpenStick 410",
+			QMIControl:       "/dev/wwan0qmi0",
+			NetworkInterface: "wwan0",
+			ATPort:           modem.Port{Path: "/dev/wwan0at0", Name: "wwan0at0", Role: modem.PortRoleAT},
+		}}},
+		Opener: &staticOpener{client: client},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return &fakeQMIRadioSession{iccid: "89441000400316034372F"}, nil
+	}
+
+	snapshot, err := manager.Refresh(context.Background(), "wwan0")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if snapshot.ICCID != "89441000400316034372" || !snapshot.SIMReady {
+		t.Fatalf("native QMI identity = %#v", snapshot)
+	}
+	client.assertDone(t)
+}
+
 func TestParseSPNASCIIAndUCS2(t *testing.T) {
 	if got := parseSPN(okResponse(`+CRSM: 144,0,"004C6562617261FFFFFFFFFFFFFFFFFFFF"`)); got != "Lebara" {
 		t.Fatalf("ASCII SPN = %q", got)
