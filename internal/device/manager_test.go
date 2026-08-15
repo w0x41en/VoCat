@@ -213,7 +213,7 @@ func TestManagerRefreshReadsNativeWWANICCIDThroughQMIUIM(t *testing.T) {
 	}}
 	manager, err := NewManager(Options{
 		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
-			ID:               "wwan0",
+			ID:               "mhi-wwan0",
 			Product:          "OpenStick 410",
 			QMIControl:       "/dev/wwan0qmi0",
 			NetworkInterface: "wwan0",
@@ -232,7 +232,7 @@ func TestManagerRefreshReadsNativeWWANICCIDThroughQMIUIM(t *testing.T) {
 		return &fakeQMIRadioSession{iccid: "89441000400316034372F"}, nil
 	}
 
-	snapshot, err := manager.Refresh(context.Background(), "wwan0")
+	snapshot, err := manager.Refresh(context.Background(), "mhi-wwan0")
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}

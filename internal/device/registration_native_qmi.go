@@ -36,9 +36,9 @@ const (
 )
 
 func isNativeQMICandidate(candidate modem.Candidate) bool {
-	deviceID := strings.TrimSpace(candidate.ID)
+	deviceID := nativeQMIInterfaceName(candidate)
 	control := strings.TrimSpace(candidate.QMIControl)
-	if deviceID == "" || control == "" || !strings.HasPrefix(deviceID, "wwan") {
+	if deviceID == "" || control == "" {
 		return false
 	}
 	base := strings.TrimSpace(control)
@@ -46,6 +46,23 @@ func isNativeQMICandidate(candidate modem.Candidate) bool {
 		base = base[slash+1:]
 	}
 	return strings.HasPrefix(base, deviceID+"qmi")
+}
+
+// nativeQMIInterfaceName normalizes discovery's mhi-wwanN ID to the Linux
+// WWAN interface name used by the paired wwanNqmiM control node. Tests and
+// callers may also provide the already-normalized wwanN form directly.
+func nativeQMIInterfaceName(candidate modem.Candidate) string {
+	if network := strings.TrimSpace(candidate.NetworkInterface); strings.HasPrefix(network, "wwan") {
+		return network
+	}
+	id := strings.TrimSpace(candidate.ID)
+	if strings.HasPrefix(id, "mhi-wwan") {
+		return strings.TrimPrefix(id, "mhi-")
+	}
+	if strings.HasPrefix(id, "wwan") {
+		return id
+	}
+	return ""
 }
 
 func (manager *Manager) openNativeQMIRegistration(

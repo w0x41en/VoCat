@@ -47,8 +47,8 @@ func (manager *Manager) nativeQMIControl(id string) (string, bool, error) {
 	}
 	candidate := manager.candidateFor(state)
 	controlDevice := strings.TrimSpace(candidate.QMIControl)
-	deviceID := strings.TrimSpace(candidate.ID)
-	if controlDevice == "" || deviceID == "" || !strings.HasPrefix(deviceID, "wwan") {
+	deviceID := nativeQMIInterfaceName(candidate)
+	if controlDevice == "" || deviceID == "" {
 		return "", false, nil
 	}
 	base := filepath.Base(controlDevice)
