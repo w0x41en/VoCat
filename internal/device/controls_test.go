@@ -17,6 +17,8 @@ type fakeQMIRadioSession struct {
 	getErr     error
 	setErr     error
 	closeCount int
+	iccid      string
+	iccidErr   error
 }
 
 func (session *fakeQMIRadioSession) GetOperatingMode(context.Context) (qmi.OperatingMode, error) {
@@ -40,6 +42,10 @@ func (session *fakeQMIRadioSession) SetOperatingMode(_ context.Context, mode qmi
 func (session *fakeQMIRadioSession) Close() error {
 	session.closeCount++
 	return nil
+}
+
+func (session *fakeQMIRadioSession) GetICCID(context.Context) (string, error) {
+	return session.iccid, session.iccidErr
 }
 
 func newStartedNativeQMITestManager(t *testing.T) (*Manager, *staticOpener, string) {
