@@ -64,6 +64,6 @@ func (opener SerialOpener) Open(ctx context.Context, port Port) (Client, error) 
 }
 
 func isNativeWWANATPath(path string) bool {
-	_, kind := splitNativeWWANPortName(filepath.Base(filepath.Clean(path)))
-	return kind == "at"
+	_, kind, _, ok := parseWWANPortName(filepath.Base(filepath.Clean(path)))
+	return ok && kind == "at"
 }
