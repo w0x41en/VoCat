@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
@@ -19,6 +20,10 @@ type qmiRadioSession interface {
 }
 
 type qmiRadioSessionOpener func(context.Context, string) (qmiRadioSession, error)
+
+type nativeQMIICCIDSession interface {
+	GetICCID(context.Context) (string, error)
+}
 
 // nativeQMIControl identifies the QMI control node exposed by native WWAN
 // devices. USB serial modems may also advertise a control path, but only the
@@ -42,6 +47,8 @@ type productionQMIRadioSession struct {
 	dms    *qmi.DMSService
 	nas    *qmi.NASService
 	nasErr error
+	uimMu  sync.Mutex
+	uim    *qmi.UIMService
 	lease  *qmiport.Lease
 }
 
@@ -150,6 +157,22 @@ func openQMIRadioSession(ctx context.Context, controlDevice string) (qmiRadioSes
 	}, nil
 }
 
+func (session *productionQMIRadioSession) GetICCID(ctx context.Context) (string, error) {
+	if session == nil || session.client == nil {
+		return "", errors.New("QMI UIM session is unavailable")
+	}
+	session.uimMu.Lock()
+	defer session.uimMu.Unlock()
+	if session.uim == nil {
+		uim, err := qmi.NewUIMServiceWithContext(ctx, session.client)
+		if err != nil {
+			return "", err
+		}
+		session.uim = uim
+	}
+	return session.uim.GetICCID(ctx)
+}
+
 func (session *productionQMIRadioSession) GetOperatingMode(ctx context.Context) (qmi.OperatingMode, error) {
 	return session.dms.GetOperatingMode(ctx)
 }
@@ -163,6 +186,12 @@ func (session *productionQMIRadioSession) Close() error {
 		return nil
 	}
 	var closeErrors []error
+	session.uimMu.Lock()
+	if session.uim != nil {
+		closeErrors = append(closeErrors, session.uim.Close())
+		session.uim = nil
+	}
+	session.uimMu.Unlock()
 	if session.dms != nil {
 		closeErrors = append(closeErrors, session.dms.Close())
 		session.dms = nil
