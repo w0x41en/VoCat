@@ -47,6 +47,13 @@ type EC20SensitiveATExecutor interface {
 	ExecuteSensitiveAT(context.Context, string, string) (modem.Response, error)
 }
 
+// EC20NativeICCIDReader is optional. Native Qualcomm WWAN firmware may reject
+// AT+CCID/QCCID, so production's device mapper can provide the authoritative
+// ICCID through QMI UIM while transcript and legacy AT executors keep working.
+type EC20NativeICCIDReader interface {
+	ReadNativeQMIICCID(context.Context, string) (string, error)
+}
+
 type EC20UICCLocker interface {
 	LockUICC()
 	UnlockUICC()
@@ -306,6 +313,13 @@ func (adapter *EC20Adapter) readICCID(
 	deviceID string,
 ) (string, error) {
 	var lastErr error
+	if reader, ok := adapter.executor.(EC20NativeICCIDReader); ok {
+		if iccid, err := reader.ReadNativeQMIICCID(ctx, deviceID); err == nil {
+			return iccid, nil
+		} else {
+			lastErr = err
+		}
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		for _, command := range []string{"AT+CCID", "AT+QCCID"} {
 			response, err := adapter.execute(ctx, deviceID, command)

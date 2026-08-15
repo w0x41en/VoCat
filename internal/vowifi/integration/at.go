@@ -29,6 +29,10 @@ type uiccLocker interface {
 	UnlockUICC()
 }
 
+type nativeICCIDReader interface {
+	ReadNativeQMIICCID(context.Context, string) (string, error)
+}
+
 func (mapper ATMapper) LockUICC() {
 	if locker, ok := mapper.Devices.(uiccLocker); ok {
 		locker.LockUICC()
@@ -71,6 +75,25 @@ func (mapper ATMapper) ExecuteSensitiveAT(
 		return modem.Response{}, err
 	}
 	return mapper.Devices.ExecuteSensitiveAT(ctx, physicalID, command)
+}
+
+// ReadNativeQMIICCID lets native WWAN integrations use the modem's UIM
+// service when Qualcomm 410 firmware does not implement AT+CCID/QCCID.
+// Legacy AT-only devices return the reader's unsupported error and keep their
+// existing AT fallback in the VoWiFi adapter.
+func (mapper ATMapper) ReadNativeQMIICCID(
+	ctx context.Context,
+	configuredID string,
+) (string, error) {
+	reader, ok := mapper.Devices.(nativeICCIDReader)
+	if !ok {
+		return "", errors.New("native QMI ICCID reader is unavailable")
+	}
+	physicalID, err := mapper.resolve(ctx, configuredID)
+	if err != nil {
+		return "", err
+	}
+	return reader.ReadNativeQMIICCID(ctx, physicalID)
 }
 
 func (mapper ATMapper) resolve(

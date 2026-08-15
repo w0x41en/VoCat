@@ -40,3 +40,24 @@ func (manager *Manager) readNativeQMIICCID(ctx context.Context, candidate modem.
 	}
 	return iccid, nil
 }
+
+// ReadNativeQMIICCID exposes the native WWAN identity path to integrations
+// such as VoWiFi that need to verify the active SIM independently of a full
+// device snapshot. Non-native modems return an error so their existing AT
+// identity path remains the fallback.
+func (manager *Manager) ReadNativeQMIICCID(ctx context.Context, id string) (string, error) {
+	if manager == nil {
+		return "", errors.New("QMI UIM ICCID reader is unavailable")
+	}
+	state, err := manager.lookup(id)
+	if err != nil {
+		return "", err
+	}
+	candidate := manager.candidateFor(state)
+	if !isNativeQMICandidate(candidate) {
+		return "", errors.New("device does not expose native QMI UIM ICCID")
+	}
+	queryContext, cancel := manager.withTimeout(ctx, manager.commandTimeout*5)
+	defer cancel()
+	return manager.readNativeQMIICCID(queryContext, candidate)
+}
