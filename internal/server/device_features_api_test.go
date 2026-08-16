@@ -374,6 +374,15 @@ func TestHandleESIMShapes(t *testing.T) {
 		t.Fatalf("switch data = %v", data)
 	}
 
+	// The interactive switch endpoint uses the same transaction but emits SSE
+	// progress and remains a GET endpoint for the browser's stream reader.
+	streamOK := httptest.NewRecorder()
+	streamReq := httptest.NewRequest(http.MethodGet, "/esim/actions/switch/stream?iccid=8900000000000000001&aid_hex=A0", nil)
+	present.handleESIM(streamOK, streamReq, []string{"actions", "switch", "stream"}, "dev1", "dev1", true)
+	if streamOK.Code != http.StatusOK || !strings.Contains(streamOK.Body.String(), "event: connected") || !strings.Contains(streamOK.Body.String(), `"step":"done"`) {
+		t.Fatalf("switch SSE status/body = %d/%s", streamOK.Code, streamOK.Body.String())
+	}
+
 	// Disable happy path routes the active profile to ES10c DisableProfile.
 	disableOK := httptest.NewRecorder()
 	disableReq := httptest.NewRequest(http.MethodPost, "/esim/actions/disable", strings.NewReader(`{"iccid":"8900000000000000001","aid_hex":"A0000005591010FFFFFFFF8900000100"}`))

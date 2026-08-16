@@ -56,6 +56,14 @@ type DeviceController interface {
 	ESIMChipInfo(context.Context, string) (*device.EsimChipInfo, error)
 }
 
+// esimProgressDeviceController is optional so older test doubles and external
+// controller implementations keep the original DeviceController contract.
+// device.Manager implements it; the POST endpoint falls back to the legacy
+// method when a controller does not expose progress.
+type esimProgressDeviceController interface {
+	ESIMSwitchProfileWithProgress(context.Context, string, string, string, func(device.EsimProgress)) error
+}
+
 type activeESIMProfileReader interface {
 	ActiveESIMProfileName(string) string
 }
@@ -1313,6 +1321,8 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "esim_cat_busy", "The eUICC is busy with a SIM Toolkit operation. Wait a moment and retry disabling the profile.")
 	case errors.Is(err, device.ErrESIMSwitchPreviousUnknown):
 		writeError(w, http.StatusConflict, "esim_switch_state_unknown", "The modem could not confirm the current active profile safely; refresh the device and retry the switch.")
+	case errors.Is(err, device.ErrESIMSwitchInProgress):
+		writeError(w, http.StatusConflict, "esim_switch_in_progress", "Another eSIM profile switch is already in progress; wait for it to finish.")
 	case errors.Is(err, device.ErrESIMSwitchRollbackFailed):
 		writeError(w, http.StatusServiceUnavailable, "esim_switch_rollback_failed", err.Error())
 	case errors.Is(err, device.ErrInvalidNetworkAPN):
@@ -1668,6 +1678,7 @@ func deviceSummary(entry device.Device) map[string]any {
 		"vowifi_enabled":           false,
 		"vowifi_active":            false,
 		"vowifi_runtime":           runtime,
+		"switching_to_iccid":       entry.SwitchingToICCID,
 		"modem":                    summary,
 		"local_phone":              phone,
 		"phone_number_source":      phoneSource,

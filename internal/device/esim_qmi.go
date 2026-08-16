@@ -262,12 +262,18 @@ func openQMIEUICCSession(
 	ctx context.Context,
 	controlDevice string,
 ) (qmiEUICCSession, error) {
+	openStartedAt := time.Now()
 	openContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	lease, err := qmiport.Acquire(openContext, controlDevice)
+	gateMs := time.Since(openStartedAt).Milliseconds()
 	if err != nil {
+		recordQMIOpenTiming(ctx, time.Since(openStartedAt).Milliseconds(), gateMs, 0, 0, err)
 		return nil, err
 	}
+	timing := qmiOpenTimingFrom(ctx)
+	timing.gateMs = gateMs
+	timing.populated = true
 	opts := qmi.DefaultClientOptions()
 	// The host also uses qmicli for registration snapshots. Route every active
 	// QMI client through qmi-proxy while qmiport keeps the kernel WWAN endpoint
@@ -276,18 +282,55 @@ func openQMIEUICCSession(
 	// ES10 APDUs can contain profile metadata and download material. Never emit
 	// raw QMI frames or APDU bodies through the library logger.
 	opts.Logf = func(qmi.ClientLogLevel, string, ...any) {}
+	clientStartedAt := time.Now()
 	client, err := qmi.NewClientWithOptions(openContext, controlDevice, opts)
+	timing.clientMs = time.Since(clientStartedAt).Milliseconds()
 	if err != nil {
 		lease.Release()
+		timing.timedOut = errors.Is(err, context.DeadlineExceeded) || openContext.Err() != nil
+		timing.totalMs = time.Since(openStartedAt).Milliseconds()
 		return nil, err
 	}
+	serviceStartedAt := time.Now()
 	uim, err := qmi.NewUIMServiceWithContext(openContext, client)
+	timing.serviceMs = time.Since(serviceStartedAt).Milliseconds()
 	if err != nil {
 		_ = client.Close()
 		lease.Release()
+		timing.timedOut = errors.Is(err, context.DeadlineExceeded) || openContext.Err() != nil
+		timing.totalMs = time.Since(openStartedAt).Milliseconds()
 		return nil, err
 	}
+	timing.totalMs = time.Since(openStartedAt).Milliseconds()
 	return &productionDeviceQMIUIMSession{client: client, uim: uim, lease: lease}, nil
+}
+
+// qmiOpenTimingFrom returns the measurement struct the caller threaded through
+// ctx, or a fresh local one when this open was not a probed read (for example
+// the ES10 channel used by a switch or the recovery power-cycle). Pointer
+// identity matters: the probed caller reads the same struct after the open, so
+// mutations here must land on the value it placed in the context.
+func qmiOpenTimingFrom(ctx context.Context) *qmiOpenTiming {
+	if timing, ok := ctx.Value(qmiOpenTimingKey{}).(*qmiOpenTiming); ok && timing != nil {
+		return timing
+	}
+	return &qmiOpenTiming{}
+}
+
+// recordQMIOpenTiming publishes the per-open phase timings to the timing struct
+// carried in ctx (set by readNativeQMIICCID / readNativeQMIDMSICCID), which the
+// caller then attaches to the qmi_iccid_probe log. openQMIEUICCSession is
+// package-level and has no access to the manager logger, so the raw measurements
+// travel through the context instead.
+func recordQMIOpenTiming(ctx context.Context, totalMs, gateMs, clientMs, serviceMs int64, openErr error) {
+	timing := qmiOpenTimingFrom(ctx)
+	timing.totalMs = totalMs
+	timing.gateMs = gateMs
+	timing.clientMs = clientMs
+	timing.serviceMs = serviceMs
+	if openErr != nil && errors.Is(openErr, context.DeadlineExceeded) {
+		timing.timedOut = true
+	}
 }
 
 func (session *productionDeviceQMIUIMSession) OpenLogicalChannel(

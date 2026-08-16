@@ -29,6 +29,26 @@ const isdRAID = "A0000005591010FFFFFFFF8900000100"
 
 const xesimISDRAID = "A0000005591010FFFFFFFF8900000177"
 
+// qmiOpenTimingKey carries per-attempt QMI-UIM open timing from the callers in
+// esim.go into openQMIEUICCSession, which is package-level and has no logger.
+// The plan splits the 113 s switch window into gate wait / client build /
+// service allocation so we can tell whether the budget is self-inflicted
+// (qmiport gate contended or 3 s budget too short) or the 410 firmware really
+// does take minutes to republish the new ICCID.
+type qmiOpenTimingKey struct{}
+
+// qmiOpenTiming records the three open phases. Times are in milliseconds,
+// relative to a single qmiEUICCOpener call.
+type qmiOpenTiming struct {
+	gateMs    int64 // qmiport.Acquire (gate wait + keepalive)
+	clientMs  int64 // qmi.NewClientWithOptions
+	serviceMs int64 // NewUIMServiceWithContext
+	totalMs   int64 // the whole open() call including the above
+	openMs    int64 // caller's open budget (commandTimeout), for the "open_ms≈3000" self-inflicted check
+	populated bool  // the phase split was actually measured (only openQMIEUICCSession records it)
+	timedOut  bool  // the open() call returned a context deadline exceeded
+}
+
 // eSTK multi-SE products expose each eUICC storage through its own vendor
 // ISD-R AID. The standard GSMA AID aliases one of them, so probing only that
 // AID silently hides the second storage.
@@ -57,6 +77,12 @@ var (
 // ErrNoEUICC is returned when the inserted card exposes no eUICC ISD-R, so the
 // HTTP layer can render the empty state instead of an error.
 var ErrNoEUICC = errNoEUICC
+
+// ErrESIMSwitchInProgress prevents a second mutating request from racing the
+// first EnableProfile transaction. The target is exposed separately through
+// Device.SwitchingToICCID so callers can render progress without treating the
+// normal modem recovery flag as the transaction state.
+var ErrESIMSwitchInProgress = errors.New("esim: another profile switch is already in progress")
 
 // ErrEUICCChannelStuck means the modem kept rejecting MANAGE CHANNEL / SELECT
 // ISD-R, or QMI-UIM still returned INJECT_TIMEOUT after one automatic UIM reset
@@ -675,9 +701,20 @@ func validProfileICCID(iccid string) bool {
 
 // ESIMListProfiles reads the eUICC profile list via ES10c GetProfilesInfo.
 func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimInfo, error) {
+	// A switch marks the target before taking the eSIM mutex. Return the last
+	// known inventory immediately so the eSIM page remains usable during the
+	// hardware's ~120-second ICCID republish window.
+	if manager.esimSwitchInFlight(id) {
+		if cached, ok := manager.cachedESIMInfo(id); ok {
+			return cached, nil
+		}
+		return EsimInfo{}, errESIMRecovering
+	}
 	manager.lockESIM()
 	defer manager.unlockESIM()
-	if manager.esimRecoveryActive(id) {
+	// The switch may have set its marker while this goroutine was waiting for
+	// lockESIM. Check again after acquiring the lock to close that race.
+	if manager.esimSwitchInFlight(id) || manager.esimRecoveryActive(id) {
 		if cached, ok := manager.cachedESIMInfo(id); ok {
 			return cached, nil
 		}
@@ -698,7 +735,23 @@ func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimIn
 }
 
 // ESIMSwitchProfile enables one profile by ICCID via ES10c EnableProfile.
+// It is the compatibility wrapper used by bots and scheduled tasks; the HTTP
+// layer uses ESIMSwitchProfileWithProgress for the long-running SSE flow.
 func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid string, aidHex string) error {
+	return manager.ESIMSwitchProfileWithProgress(ctx, id, iccid, aidHex, nil)
+}
+
+// ESIMSwitchProfileWithProgress runs the same atomic switch transaction as
+// ESIMSwitchProfile and emits coarse progress milestones for interactive
+// clients.
+func (manager *Manager) ESIMSwitchProfileWithProgress(
+	ctx context.Context,
+	id string,
+	iccid string,
+	aidHex string,
+	progress func(EsimProgress),
+) error {
+	switchStartedAt := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -712,11 +765,25 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	if _, err := buildEnableProfileRequest(iccid); err != nil {
 		return err
 	}
+	if err := manager.beginESIMSwitch(id, iccid); err != nil {
+		return err
+	}
+	defer manager.finishESIMSwitch(id, iccid)
+	report := func(step, msg string, pct int) {
+		if progress != nil {
+			progress(EsimProgress{Step: step, Msg: msg, Pct: pct})
+		}
+	}
+	report("started", "已接受切卡请求，正在准备模组…", 0)
 	manager.lockESIM()
 	defer manager.unlockESIM()
 	if err := manager.waitForESIMRecovery(ctx, id); err != nil {
 		return err
 	}
+	manager.logEvent(slog.LevelInfo, "SIM profile switch recovery wait done",
+		"category", "sim_switch", "event", "profile_switch_recovery_wait_done",
+		"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
+		"duration_ms", time.Since(switchStartedAt).Milliseconds())
 
 	// EnableProfile is allowed to disable the current profile as part of the
 	// card-side commit.  It is not a hardware transaction: if the modem loses
@@ -733,6 +800,8 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		manager.logEvent(slog.LevelInfo, "SIM profile switch already satisfied",
 			"category", "sim_switch", "event", "profile_switch_already_active",
 			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid))
+		report("verified", "目标 Profile 已经是当前活动卡", 95)
+		report("done", "Profile 切换完成", 100)
 		return nil
 	}
 
@@ -747,8 +816,10 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	} else {
 		manager.logEvent(slog.LevelInfo, "SIM profile accepted by eUICC; modem recovery queued",
 			"category", "sim_switch", "event", "profile_switch_accepted",
-			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "result_code", 0)
+			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "result_code", 0,
+			"duration_ms", time.Since(switchStartedAt).Milliseconds())
 	}
+	report("accepted", "eUICC 已接受切卡请求，正在重新初始化模组…", 5)
 	// EnableProfile(refresh=yes) invalidates the modem-side WMS subscription
 	// and storage context even after the new profile is visible through UIM.
 	// Make the next SMS operation rebuild WMS before it attempts List Messages;
@@ -758,21 +829,28 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 	// The eUICC may have committed immediately before a transport error. Always
 	// reset and verify after an APDU attempt, including a card-side rejection;
 	// only the live ICCID decides whether the transaction committed.
-	manager.startProfileSwitchRecovery(id)
+	manager.startProfileSwitchRecovery(id, iccid)
 
 	verifyContext, cancelVerify := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 	defer cancelVerify()
 	recoveryErr := manager.waitForESIMRecovery(verifyContext, id)
 	var verifyErr error
 	if recoveryErr == nil {
-		verifyErr = manager.verifySwitchedICCID(verifyContext, id, iccid)
+		report("reset_done", "模组已复位，等待新卡上线…", 15)
+		verifyErr = manager.verifySwitchedICCIDWithProgress(verifyContext, id, iccid, report)
 	}
+	manager.logEvent(slog.LevelInfo, "SIM profile switch identity verification done",
+		"category", "sim_switch", "event", "profile_switch_verify_done",
+		"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
+		"duration_ms", time.Since(switchStartedAt).Milliseconds(),
+		"verify_error", errString(verifyErr), "recovery_error", errString(recoveryErr))
 	if verifyErr == nil && recoveryErr == nil {
 		// The cache is deliberately changed only after the driver plane proves
 		// that the target is active. A failed/partial switch therefore cannot
 		// make the UI claim that the target is enabled while the old profile is
 		// actually disabled.
 		manager.markCachedProfileEnabled(id, iccid)
+		report("verified", "已确认目标 ICCID，正在更新设备状态…", 95)
 		// Native QMI already gives us the authoritative ICCID immediately. The
 		// slower AT snapshot is best-effort after that merge; it must not add up
 		// to another eight command-timeout windows before returning success.
@@ -784,7 +862,10 @@ func (manager *Manager) ESIMSwitchProfile(ctx context.Context, id string, iccid 
 		}
 		manager.logEvent(slog.LevelInfo, "SIM profile switch completed",
 			"category", "sim_switch", "event", "profile_switch_completed",
-			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid))
+			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
+			"duration_ms", time.Since(switchStartedAt).Milliseconds(),
+			"snapshot_done_ms", time.Since(switchStartedAt).Milliseconds())
+		report("done", "Profile 切换完成", 100)
 		return nil
 	}
 
@@ -955,7 +1036,7 @@ func (manager *Manager) rollbackFailedProfileSwitch(
 	attempt, rollbackErr := manager.sendEnableProfile(rollbackContext, id, previousICCID, aidHex)
 	if attempt.attempted {
 		manager.markQMIWMSContextPending(id)
-		manager.startProfileSwitchRecovery(id)
+		manager.startProfileSwitchRecovery(id, previousICCID)
 		if waitErr := manager.waitForESIMRecovery(rollbackContext, id); waitErr != nil {
 			rollbackErr = errors.Join(rollbackErr, waitErr)
 		} else if verifyErr := manager.verifySwitchedICCID(rollbackContext, id, previousICCID); verifyErr != nil {
@@ -980,7 +1061,11 @@ func (manager *Manager) rollbackFailedProfileSwitch(
 		fmt.Errorf("esim: target ICCID %s was not activated and previous ICCID %s could not be restored: %w", targetICCID, previousICCID, errors.Join(switchErr, rollbackErr)))
 }
 
-func (manager *Manager) startProfileSwitchRecovery(id string) {
+func (manager *Manager) startProfileSwitchRecovery(id string, target ...string) {
+	recoveryTarget := ""
+	if len(target) > 0 {
+		recoveryTarget = strings.TrimSpace(target[0])
+	}
 	done := make(chan struct{})
 	manager.esimRecoveryMu.Lock()
 	if manager.esimRecoveries == nil {
@@ -995,9 +1080,14 @@ func (manager *Manager) startProfileSwitchRecovery(id string) {
 	manager.esimRecoveries[id] = done
 	manager.esimRecoveryMu.Unlock()
 	manager.logEvent(slog.LevelInfo, "SIM profile modem recovery started",
-		"category", "sim_switch", "event", "profile_switch_recovery_started", "device_id", id)
+		"category", "sim_switch", "event", "profile_switch_recovery_started", "device_id", id,
+		"target_iccid_last4", redactSubscriberID(recoveryTarget))
 	go func() {
-		manager.recoverAfterProfileSwitch(id)
+		// Every recovery exit clears the legacy flag. The in-flight target is
+		// cleared by ESIMSwitchProfile's own defer and remains authoritative for
+		// the longer ICCID verification window.
+		defer manager.finishRecovery(id)
+		manager.recoverAfterProfileSwitch(id, recoveryTarget)
 		manager.esimRecoveryMu.Lock()
 		if manager.esimRecoveries[id] == done {
 			delete(manager.esimRecoveries, id)
@@ -1005,7 +1095,8 @@ func (manager *Manager) startProfileSwitchRecovery(id string) {
 		}
 		manager.esimRecoveryMu.Unlock()
 		manager.logEvent(slog.LevelInfo, "SIM profile modem recovery finished",
-			"category", "sim_switch", "event", "profile_switch_recovery_finished", "device_id", id)
+			"category", "sim_switch", "event", "profile_switch_recovery_finished", "device_id", id,
+			"target_iccid_last4", redactSubscriberID(recoveryTarget))
 	}()
 }
 
@@ -1029,6 +1120,47 @@ func (manager *Manager) esimRecoveryActive(id string) bool {
 	active := manager.esimRecoveries[id] != nil
 	manager.esimRecoveryMu.Unlock()
 	return active
+}
+
+// beginESIMSwitch publishes the transaction before the card mutex is taken.
+// This is what lets read-only eSIM requests return the cached inventory rather
+// than waiting behind a two-minute hardware operation.
+func (manager *Manager) beginESIMSwitch(id, target string) error {
+	manager.esimSwitchMu.Lock()
+	defer manager.esimSwitchMu.Unlock()
+	if manager.esimSwitchTargets == nil {
+		manager.esimSwitchTargets = make(map[string]string)
+	}
+	if existing := strings.TrimSpace(manager.esimSwitchTargets[id]); existing != "" {
+		return fmt.Errorf("%w: target %s", ErrESIMSwitchInProgress, existing)
+	}
+	manager.esimSwitchTargets[id] = strings.TrimSpace(target)
+	return nil
+}
+
+// finishESIMSwitch removes only the marker owned by target. The comparison
+// prevents an old request's deferred cleanup from clearing a newer marker if a
+// caller ever recovers from a panic or cancellation out of order.
+func (manager *Manager) finishESIMSwitch(id, target string) {
+	manager.esimSwitchMu.Lock()
+	if current := manager.esimSwitchTargets[id]; strings.EqualFold(current, strings.TrimSpace(target)) {
+		delete(manager.esimSwitchTargets, id)
+	}
+	manager.esimSwitchMu.Unlock()
+}
+
+func (manager *Manager) esimSwitchInFlight(id string) bool {
+	manager.esimSwitchMu.RLock()
+	active := strings.TrimSpace(manager.esimSwitchTargets[id]) != ""
+	manager.esimSwitchMu.RUnlock()
+	return active
+}
+
+func (manager *Manager) esimSwitchTarget(id string) (string, bool) {
+	manager.esimSwitchMu.RLock()
+	target := strings.TrimSpace(manager.esimSwitchTargets[id])
+	manager.esimSwitchMu.RUnlock()
+	return target, target != ""
 }
 
 func cloneESIMInfo(info EsimInfo) EsimInfo {
@@ -1066,6 +1198,7 @@ func (manager *Manager) markCachedProfileEnabled(id, iccid string) {
 		manager.esimCache[id] = info
 		manager.updateActiveESIMProfileNameLocked(id, info)
 	}
+	manager.updateCachedInventoryProfileStateLocked(id, iccid, true)
 	manager.esimCacheMu.Unlock()
 }
 
@@ -1104,7 +1237,35 @@ func (manager *Manager) markCachedProfileDisabled(id, iccid string) {
 		manager.esimCache[id] = info
 		manager.updateActiveESIMProfileNameLocked(id, info)
 	}
+	manager.updateCachedInventoryProfileStateLocked(id, iccid, false)
 	manager.esimCacheMu.Unlock()
+}
+
+// updateCachedInventoryProfileStateLocked keeps the cache returned while a
+// switch is in flight consistent with the verified state once the transaction
+// completes. The caller must hold esimCacheMu.
+func (manager *Manager) updateCachedInventoryProfileStateLocked(id, iccid string, enabled bool) {
+	entries, ok := manager.esimInventoryCache[id]
+	if !ok {
+		return
+	}
+	for entryIndex := range entries {
+		for profileIndex := range entries[entryIndex].Info.Profiles {
+			profile := &entries[entryIndex].Info.Profiles[profileIndex]
+			if enabled {
+				profile.State = 0
+				profile.StateText = i18n.T("已禁用")
+			}
+			if strings.EqualFold(profile.ICCID, strings.TrimSpace(iccid)) {
+				profile.State = 1
+				profile.StateText = i18n.T("已启用")
+				if !enabled {
+					profile.State = 0
+					profile.StateText = i18n.T("已禁用")
+				}
+			}
+		}
+	}
 }
 
 func (manager *Manager) removeCachedProfile(id, iccid string) {
@@ -1143,7 +1304,7 @@ func (manager *Manager) renameCachedProfile(id, iccid, nickname string) {
 // recoverAfterProfileSwitch owns the post-commit reset independently of the
 // initiating HTTP request. EC20 commonly drops the AT port while processing
 // CFUN=1,1, so the reset error is intentionally followed by discovery retries.
-func (manager *Manager) recoverAfterProfileSwitch(id string) {
+func (manager *Manager) recoverAfterProfileSwitch(id, target string) {
 	resetContext, cancelReset := context.WithTimeout(context.Background(), manager.longTimeout)
 	resetErr := manager.rebootForProfileSwitch(resetContext, id)
 	cancelReset()
@@ -1154,12 +1315,28 @@ func (manager *Manager) recoverAfterProfileSwitch(id string) {
 	// Keep the slower path for AT modems and for a reset that did not complete.
 	if resetErr == nil {
 		if _, native, nativeErr := manager.nativeQMIControl(id); nativeErr == nil && native {
+			recoveryStartedAt := time.Now()
 			identityContext, cancelIdentity := context.WithTimeout(context.Background(), manager.commandTimeout*2)
 			live, _, identityErr := manager.readNativeQMIICCID(identityContext, id)
 			cancelIdentity()
+			// Diagnostic probe for the "UI shows the old card for two minutes with
+			// no in-progress hint" bug: log what identity the recovery callback is
+			// about to publish before the merge, so the +1.3 s /merging-old-card
+			// theory can be confirmed or refuted without changing merge behavior.
+			manager.logEvent(slog.LevelInfo, "SIM profile switch recovery identity",
+				"category", "sim_switch", "event", "profile_switch_recovery_identity",
+				"device_id", id,
+				"uim_last4", redactSubscriberID(live),
+				"elapsed_ms", time.Since(recoveryStartedAt).Milliseconds(),
+				"error", errString(identityErr))
 			if identityErr == nil && validProfileICCID(live) {
-				manager.mergeVerifiedProfileSnapshot(id, live)
-				manager.finishRecovery(id)
+				// A native read can still be the old card for a short period after
+				// reset. Never publish it into the overview while a switch has a
+				// concrete target; verification owns the final commit.
+				if strings.TrimSpace(target) == "" || strings.EqualFold(live, target) {
+					manager.mergeVerifiedProfileSnapshot(id, live)
+					manager.finishRecovery(id)
+				}
 				return
 			}
 		}
@@ -1251,8 +1428,8 @@ func profileSwitchVerificationTimeout(manager *Manager) time.Duration {
 	// snapshot attempts reopening its USB serial port. Keep the HTTP operation
 	// alive for that recovery, with a practical floor for unusually slow hosts.
 	timeout := manager.longTimeout*2 + 90*time.Second
-	if timeout < 2*time.Minute {
-		return 2 * time.Minute
+	if timeout < 4*time.Minute {
+		return 4 * time.Minute
 	}
 	return timeout
 }
@@ -1262,21 +1439,54 @@ func profileSwitchVerificationTimeout(manager *Manager) time.Duration {
 // is finalized by REFRESH/reset. The UI must not report success until the modem
 // is actually exposing the requested ICCID.
 func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected string) error {
+	return manager.verifySwitchedICCIDWithProgress(ctx, id, expected, nil)
+}
+
+func (manager *Manager) verifySwitchedICCIDWithProgress(
+	ctx context.Context,
+	id string,
+	expected string,
+	progress func(step, msg string, pct int),
+) error {
 	expected = strings.TrimSpace(expected)
 	const (
 		pollInterval = 2 * time.Second
-		maxAttempts  = 60
+		// The 410 can expose the previous ICCID for about two minutes after
+		// EnableProfile. The context deadline is the primary bound; this cap is
+		// only defensive for callers that accidentally pass an unbounded ctx.
+		maxAttempts = 300
 	)
+	verifyStartedAt := time.Now()
+	attemptsUsed := 0
 	var lastICCID string
+	var lastLoggedICCID string
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
+		}
+		attemptsUsed = attempt + 1
+		if progress != nil {
+			elapsed := time.Since(verifyStartedAt)
+			pct := 15 + int(float64(elapsed)/float64(120*time.Second)*75)
+			if pct > 90 {
+				pct = 90
+			}
+			progress("waiting_card", "模组仍在报告旧卡，这一步通常需要约 2 分钟…", pct)
+		}
 		live, nativeQMI, qmiErr := manager.readNativeQMIICCID(ctx, id)
 		if nativeQMI {
 			if qmiErr != nil {
 				lastErr = qmiErr
 			} else {
 				lastICCID = live
-				if live == expected {
+				if strings.EqualFold(live, expected) {
+					manager.logEvent(slog.LevelInfo, "SIM profile switch verify matched",
+						"category", "sim_switch", "event", "profile_switch_verify_finished",
+						"device_id", id, "target_iccid_last4", redactSubscriberID(expected),
+						"uim_last4", redactSubscriberID(live), "attempts_used", attemptsUsed,
+						"total_ms", time.Since(verifyStartedAt).Milliseconds(), "reason", "matched")
 					return nil
 				}
 				lastErr = fmt.Errorf("modem still reports ICCID %s", live)
@@ -1287,7 +1497,12 @@ func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected st
 			if dmsLive, dmsNative, dmsErr := manager.readNativeQMIDMSICCID(ctx, id); dmsNative {
 				if dmsErr == nil {
 					lastICCID = dmsLive
-					if dmsLive == expected {
+					if strings.EqualFold(dmsLive, expected) {
+						manager.logEvent(slog.LevelInfo, "SIM profile switch verify matched",
+							"category", "sim_switch", "event", "profile_switch_verify_finished",
+							"device_id", id, "target_iccid_last4", redactSubscriberID(expected),
+							"uim_last4", redactSubscriberID(dmsLive), "attempts_used", attemptsUsed,
+							"total_ms", time.Since(verifyStartedAt).Milliseconds(), "reason", "matched")
 						return nil
 					}
 					lastErr = fmt.Errorf("modem still reports ICCID %s", dmsLive)
@@ -1310,12 +1525,26 @@ func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected st
 					continue
 				}
 				lastICCID = live
-				if live == expected {
+				if strings.EqualFold(live, expected) {
+					manager.logEvent(slog.LevelInfo, "SIM profile switch verify matched",
+						"category", "sim_switch", "event", "profile_switch_verify_finished",
+						"device_id", id, "target_iccid_last4", redactSubscriberID(expected),
+						"uim_last4", redactSubscriberID(live), "attempts_used", attemptsUsed,
+						"total_ms", time.Since(verifyStartedAt).Milliseconds(), "reason", "matched")
 					return nil
 				}
 				lastErr = fmt.Errorf("modem still reports ICCID %s", live)
 				break
 			}
+		}
+		if lastICCID != lastLoggedICCID || attempt%5 == 4 {
+			lastLoggedICCID = lastICCID
+			manager.logEvent(slog.LevelInfo, "SIM profile switch verify attempt",
+				"category", "sim_switch", "event", "profile_switch_verify_attempt",
+				"device_id", id, "target_iccid_last4", redactSubscriberID(expected),
+				"uim_last4", redactSubscriberID(lastICCID), "attempt", attemptsUsed,
+				"elapsed_ms", time.Since(verifyStartedAt).Milliseconds(),
+				"error", errString(lastErr))
 		}
 		if attempt+1 >= maxAttempts {
 			break
@@ -1349,6 +1578,14 @@ func (manager *Manager) verifySwitchedICCID(ctx context.Context, id, expected st
 	if lastErr == nil {
 		lastErr = ctx.Err()
 	}
+	manager.logEvent(slog.LevelInfo, "SIM profile switch verify finished",
+		"category", "sim_switch", "event", "profile_switch_verify_finished",
+		"device_id", id,
+		"target_iccid_last4", redactSubscriberID(expected),
+		"uim_last4", redactSubscriberID(lastICCID),
+		"attempts_used", attemptsUsed,
+		"total_ms", time.Since(verifyStartedAt).Milliseconds(),
+		"reason", verifyExitReason(ctx, lastICCID, lastErr, expected))
 	return fmt.Errorf("esim: EnableProfile was accepted but target ICCID %s could not be verified after modem recovery: %w", expected, lastErr)
 }
 
@@ -1459,6 +1696,7 @@ func (manager *Manager) mergeVerifiedProfileSnapshot(id, iccid string) {
 }
 
 func (manager *Manager) readNativeQMIICCID(ctx context.Context, id string) (string, bool, error) {
+	probeStartedAt := time.Now()
 	controlDevice, native, err := manager.nativeQMIControl(id)
 	if err != nil || !native {
 		return "", native, err
@@ -1468,23 +1706,32 @@ func (manager *Manager) readNativeQMIICCID(ctx context.Context, id string) (stri
 	}
 	readContext, cancel := context.WithTimeout(ctx, manager.commandTimeout)
 	defer cancel()
+	timing := &qmiOpenTiming{timedOut: false}
+	readContext = context.WithValue(readContext, qmiOpenTimingKey{}, timing)
 	session, err := manager.qmiEUICCOpener(readContext, controlDevice)
+	timing.openMs = int64(manager.commandTimeout.Milliseconds())
 	if err != nil {
+		manager.logQMIICCIDProbe(id, "uim", probeStartedAt, "", err, timing)
 		return "", true, fmt.Errorf("open QMI-UIM session for ICCID verification: %w", err)
 	}
 	defer session.Close()
 	iccid, err := session.GetICCID(readContext)
 	if err != nil {
+		manager.logQMIICCIDProbe(id, "uim", probeStartedAt, "", err, timing)
 		return "", true, fmt.Errorf("read active ICCID through QMI-UIM: %w", err)
 	}
 	iccid = strings.TrimRight(strings.ToUpper(strings.TrimSpace(iccid)), "F")
 	if !validProfileICCID(iccid) {
-		return "", true, errors.New("QMI-UIM returned no valid active ICCID")
+		err = errors.New("QMI-UIM returned no valid active ICCID")
+		manager.logQMIICCIDProbe(id, "uim", probeStartedAt, "", err, timing)
+		return "", true, err
 	}
+	manager.logQMIICCIDProbe(id, "uim", probeStartedAt, iccid, nil, timing)
 	return iccid, true, nil
 }
 
 func (manager *Manager) readNativeQMIDMSICCID(ctx context.Context, id string) (string, bool, error) {
+	probeStartedAt := time.Now()
 	controlDevice, native, err := manager.nativeQMIControl(id)
 	if err != nil || !native {
 		return "", native, err
@@ -1494,22 +1741,94 @@ func (manager *Manager) readNativeQMIDMSICCID(ctx context.Context, id string) (s
 	}
 	readContext, cancel := context.WithTimeout(ctx, manager.commandTimeout)
 	defer cancel()
+	timing := &qmiOpenTiming{timedOut: false}
+	readContext = context.WithValue(readContext, qmiOpenTimingKey{}, timing)
 	session, err := manager.qmiRadioOpener(readContext, controlDevice)
+	timing.openMs = int64(manager.commandTimeout.Milliseconds())
 	if err != nil {
+		manager.logQMIICCIDProbe(id, "dms", probeStartedAt, "", err, timing)
 		return "", true, fmt.Errorf("open QMI DMS session for ICCID verification: %w", err)
 	}
 	defer session.Close()
 	identityReader, ok := session.(qmiDMSICCIDSession)
 	if !ok {
-		return "", true, errors.New("QMI DMS ICCID verification is unavailable")
+		err = errors.New("QMI DMS ICCID verification is unavailable")
+		manager.logQMIICCIDProbe(id, "dms", probeStartedAt, "", err, timing)
+		return "", true, err
 	}
 	iccid, err := identityReader.GetICCID(readContext)
 	if err != nil {
+		manager.logQMIICCIDProbe(id, "dms", probeStartedAt, "", err, timing)
 		return "", true, fmt.Errorf("read active ICCID through QMI DMS: %w", err)
 	}
 	iccid = strings.TrimRight(strings.ToUpper(strings.TrimSpace(iccid)), "F")
 	if !validProfileICCID(iccid) {
-		return "", true, errors.New("QMI DMS returned no valid active ICCID")
+		err = errors.New("QMI DMS returned no valid active ICCID")
+		manager.logQMIICCIDProbe(id, "dms", probeStartedAt, "", err, timing)
+		return "", true, err
 	}
+	manager.logQMIICCIDProbe(id, "dms", probeStartedAt, iccid, nil, timing)
 	return iccid, true, nil
+}
+
+// logQMIICCIDProbe emits one per-attempt read probe. source is "uim" or "dms".
+// ICCID is redacted to its last four digits and the APDU bytes are never logged.
+func (manager *Manager) logQMIICCIDProbe(id, source string, startedAt time.Time, iccid string, readErr error, timing *qmiOpenTiming) {
+	if manager == nil {
+		return
+	}
+	timedOut := timing != nil && timing.timedOut
+	if readErr != nil && errors.Is(readErr, context.DeadlineExceeded) {
+		timedOut = true
+	}
+	durationMs := time.Since(startedAt).Milliseconds()
+	attrs := []any{
+		"category", "sim_switch", "event", "qmi_iccid_probe",
+		"device_id", id, "source", source,
+		"uim_last4", redactSubscriberID(iccid),
+		"read_ok", iccid != "",
+		"timed_out", timedOut,
+		"duration_ms", durationMs,
+	}
+	if timing != nil && timing.populated {
+		attrs = append(attrs,
+			"gate_ms", timing.gateMs,
+			"client_ms", timing.clientMs,
+			"service_ms", timing.serviceMs,
+			"open_ms", timing.openMs,
+		)
+	}
+	if readErr != nil {
+		attrs = append(attrs, "error", errString(readErr))
+	}
+	manager.logEvent(slog.LevelInfo, "QMI ICCID read probe",
+		attrs...)
+}
+
+// errString renders an error for log attributes without allocating on the
+// success path.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// verifyExitReason names the terminal branch verifySwitchedICCID fell into so
+// the fix choice (raising the per-open budget vs. an async POST + progress) does
+// not depend on reading error text.
+func verifyExitReason(ctx context.Context, lastICCID string, lastErr error, expected string) string {
+	if ctx != nil && ctx.Err() != nil {
+		return "ctx_deadline"
+	}
+	if lastICCID == "" {
+		return "no_valid_iccid"
+	}
+	if lastErr != nil && strings.Contains(lastErr.Error(), lastICCID) {
+		return "max_attempts"
+	}
+	if strings.TrimSpace(lastICCID) == strings.TrimSpace(expected) {
+		return "matched"
+	}
+	return "max_attempts"
 }

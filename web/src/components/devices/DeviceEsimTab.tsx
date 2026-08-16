@@ -70,6 +70,22 @@ function applyDisableLocal(groups: EsimProfileGroup[], iccid: string, aidHex?: s
   }));
 }
 
+function applySwitchLocal(groups: EsimProfileGroup[], iccid: string, aidHex?: string): EsimProfileGroup[] {
+  const clean = iccid.replace(/\s+/g, "");
+  const aid = normAid(aidHex);
+  return groups.map((g) => {
+    const inGroup = !aid || normAid(g.aidHex) === aid;
+    return {
+      ...g,
+      profiles: g.profiles.map((p) => {
+        if (!inGroup) return p;
+        const match = p.iccid.replace(/\s+/g, "") === clean;
+        return { ...p, state: match ? 1 : 0, stateText: match ? tl("已启用") : tl("已禁用") };
+      }),
+    };
+  });
+}
+
 export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, rebooting, onRebootModem, onProfileChanged }: DeviceEsimTabProps) {
   const { t } = useI18n();
   const [initialLoading, setInitialLoading] = useState(false);
@@ -77,6 +93,9 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
   const [chipInfo, setChipInfo] = useState<EsimChipInfo | null>(null);
   const [groups, setGroups] = useState<EsimProfileGroup[]>([]);
   const [switchingIccid, setSwitchingIccid] = useState<string | null>(null);
+  const [switchPct, setSwitchPct] = useState(0);
+  const [switchMsg, setSwitchMsg] = useState("");
+  const [switchErr, setSwitchErr] = useState("");
   const [deletingIccid, setDeletingIccid] = useState<string | null>(null);
   const [renamingIccid, setRenamingIccid] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -97,6 +116,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
   const [loadFailure, setLoadFailure] = useState<EsimLoadFailure | null>(null);
   const overviewAbort = useRef<AbortController | null>(null);
   const downloadAbort = useRef<AbortController | null>(null);
+  const switchAbort = useRef<AbortController | null>(null);
   const spaceTimer = useRef<number | null>(null);
   const recoveryTimers = useRef<number[]>([]);
   const loadSeq = useRef(0);
@@ -245,42 +265,58 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
       });
       if (!ok) return;
       setSwitchingIccid(iccid);
+      setSwitchPct(0);
+      setSwitchMsg(t("正在准备切卡…"));
+      setSwitchErr("");
+      const controller = new AbortController();
+      switchAbort.current = controller;
       try {
-        const endpoint = disabling ? "disable" : "switch";
-        const result = await api<{ verified?: boolean }>(`/devices/${deviceId}/esim/actions/${endpoint}`, {
-          method: "POST",
-          body: { iccid, aidHex },
-        });
+        if (disabling) {
+          await api(`/devices/${deviceId}/esim/actions/disable`, { method: "POST", body: { iccid, aidHex } });
+        } else {
+          let streamError = "";
+          let completed = false;
+          await readEventStream(
+            `/devices/${deviceId}/esim/actions/switch/stream`,
+            { iccid, aid_hex: aidHex },
+            {
+              signal: controller.signal,
+              onData: (line) => {
+                try {
+                  const ev = JSON.parse(line);
+                  if (typeof ev.pct === "number" && ev.pct >= 0) setSwitchPct(ev.pct);
+                  if (ev.msg) setSwitchMsg(ev.msg);
+                  if (ev.step === "error") {
+                    streamError = ev.msg || t("切卡失败");
+                    setSwitchErr(streamError);
+                  }
+                  if (ev.step === "done") completed = true;
+                } catch {
+                  /* ignore one malformed progress event */
+                }
+              },
+            },
+          );
+          if (streamError) throw new Error(streamError);
+          if (!completed) throw new Error(t("切卡流未确认完成"));
+          setSwitchPct(100);
+          setGroups((prev) => applySwitchLocal(prev, iccid, aidHex));
+        }
         if (disabling) {
           message.success(t("Profile 已禁用；模组正在重新初始化，恢复后即可删除"));
           setGroups((prev) => applyDisableLocal(prev, iccid, aidHex));
         } else {
-          if (result?.verified !== true) {
-            throw new Error("后端未确认目标 ICCID 已在模组中生效");
-          }
-          const refreshed = await loadProfiles(true);
-          const cleanICCID = iccid.replace(/\s+/g, "");
-          const targetAID = normAid(aidHex);
-          const confirmed = refreshed?.some(
-            (group) =>
-              (!targetAID || normAid(group.aidHex) === targetAID) &&
-              group.profiles.some(
-                (profile) => profile.iccid.replace(/\s+/g, "") === cleanICCID && profile.state === 1,
-              ),
-          );
-          if (!confirmed) {
-            throw new Error("模组 ICCID 已切换，但重新读取 eUICC 后没有确认目标 Profile 为已启用状态");
-          }
           message.success(t("Profile 启用成功"));
         }
         notifyProfileChanged();
       } catch (e) {
-        message.error(apiMessage(e) || tf("{action}失败", { action }));
+        if (!controller.signal.aborted) message.error(apiMessage(e) || tf("{action}失败", { action }));
       } finally {
+        switchAbort.current = null;
         setSwitchingIccid(null);
       }
     },
-    [deviceId, notifyProfileChanged, loadProfiles],
+    [deviceId, notifyProfileChanged, t],
   );
 
   const startRename = useCallback((iccid: string, name?: string) => {
@@ -440,6 +476,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
     () => () => {
       overviewAbort.current?.abort();
       downloadAbort.current?.abort();
+      switchAbort.current?.abort();
       if (spaceTimer.current !== null) window.clearTimeout(spaceTimer.current);
       for (const timer of recoveryTimers.current) window.clearTimeout(timer);
       recoveryTimers.current = [];
@@ -489,6 +526,17 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
           onOpenNotifications={openNotifications}
           onToggleSensitive={toggleSensitive}
         />
+      ) : null}
+      {switchingIccid ? (
+        <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 dark:border-sky-500/25 dark:bg-sky-500/10">
+          <div className="flex items-center justify-between gap-3 text-sm text-sky-800 dark:text-sky-100">
+            <span>{switchErr || switchMsg || t("正在切换 Profile…")}</span>
+            <span className="font-mono text-xs">{Math.max(0, switchPct)}%</span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-sky-100 dark:bg-sky-950/60">
+            <div className="h-full rounded-full bg-sky-500 transition-[width] duration-500" style={{ width: `${Math.min(100, Math.max(0, switchPct))}%` }} />
+          </div>
+        </div>
       ) : null}
       {groups.map((g, i) => (
         <EsimEuiccGroup

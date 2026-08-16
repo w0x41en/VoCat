@@ -381,6 +381,78 @@ func TestESIMListProfilesReturnsCacheDuringRecovery(t *testing.T) {
 	}
 }
 
+func TestESIMListProfilesReturnsCacheDuringSwitchBeforeTakingESIMLock(t *testing.T) {
+	manager := &Manager{
+		esimCache: map[string]EsimInfo{
+			"dev": {Profiles: []EsimProfile{{ICCID: "old", State: 1}}},
+		},
+		esimSwitchTargets: map[string]string{"dev": "target"},
+	}
+	// Holding the card mutex proves the fast path checks the independent
+	// in-flight marker before trying to acquire it.
+	manager.esimMu.Lock()
+	defer manager.esimMu.Unlock()
+	info, err := manager.ESIMListProfiles(context.Background(), "dev")
+	if err != nil {
+		t.Fatalf("ESIMListProfiles during switch: %v", err)
+	}
+	if len(info.Profiles) != 1 || info.Profiles[0].ICCID != "old" {
+		t.Fatalf("cached profiles = %#v", info.Profiles)
+	}
+}
+
+func TestESIMSwitchMarkerLifecycle(t *testing.T) {
+	manager := &Manager{}
+	if err := manager.beginESIMSwitch("dev", "target"); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.esimSwitchInFlight("dev") {
+		t.Fatal("switch marker was not published")
+	}
+	if target, ok := manager.esimSwitchTarget("dev"); !ok || target != "target" {
+		t.Fatalf("switch target = %q, %v", target, ok)
+	}
+	if err := manager.beginESIMSwitch("dev", "other"); !errors.Is(err, ErrESIMSwitchInProgress) {
+		t.Fatalf("duplicate switch error = %v", err)
+	}
+	manager.finishESIMSwitch("dev", "other")
+	if !manager.esimSwitchInFlight("dev") {
+		t.Fatal("wrong target cleared the switch marker")
+	}
+	manager.finishESIMSwitch("dev", "target")
+	if manager.esimSwitchInFlight("dev") {
+		t.Fatal("switch marker was not cleared")
+	}
+}
+
+func TestDeviceSnapshotExposesSwitchTarget(t *testing.T) {
+	manager := &Manager{
+		devices: map[string]*managedDevice{
+			"dev": {
+				discovered: true,
+				snapshot:   &Snapshot{DeviceID: "dev", ICCID: "old"},
+			},
+		},
+		esimSwitchTargets: map[string]string{"dev": "target"},
+	}
+	entry, err := manager.Get("dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.SwitchingToICCID != "target" || entry.Snapshot == nil || entry.Snapshot.SwitchingToICCID != "target" {
+		t.Fatalf("switch target exposure = device=%q snapshot=%#v", entry.SwitchingToICCID, entry.Snapshot)
+	}
+}
+
+func TestProfileSwitchVerificationTimeoutHasFourMinuteFloor(t *testing.T) {
+	if got := profileSwitchVerificationTimeout(&Manager{longTimeout: time.Second}); got != 4*time.Minute {
+		t.Fatalf("verification timeout = %s, want four-minute floor", got)
+	}
+	if got := profileSwitchVerificationTimeout(&Manager{longTimeout: 100 * time.Second}); got != 290*time.Second {
+		t.Fatalf("verification timeout = %s, want long-timeout budget", got)
+	}
+}
+
 func TestMarkCachedProfileEnabled(t *testing.T) {
 	manager := &Manager{
 		esimCache: map[string]EsimInfo{

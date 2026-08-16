@@ -60,13 +60,18 @@ type OperatorSelection struct {
 }
 
 type Device struct {
-	ID          string          `json:"id"`
-	Candidate   modem.Candidate `json:"candidate"`
-	Snapshot    *Snapshot       `json:"snapshot,omitempty"`
-	LastError   string          `json:"lastError,omitempty"`
-	Discovered  bool            `json:"discovered"`
-	Recovering  bool            `json:"recovering,omitempty"`
-	LastUpdated time.Time       `json:"lastUpdated,omitempty"`
+	ID         string          `json:"id"`
+	Candidate  modem.Candidate `json:"candidate"`
+	Snapshot   *Snapshot       `json:"snapshot,omitempty"`
+	LastError  string          `json:"lastError,omitempty"`
+	Discovered bool            `json:"discovered"`
+	Recovering bool            `json:"recovering,omitempty"`
+	// SwitchingToICCID is set while an eSIM EnableProfile transaction is in
+	// flight. It is intentionally independent from Recovering: a successful
+	// modem refresh can clear the latter while the eUICC is still republishing
+	// the selected profile.
+	SwitchingToICCID string    `json:"switchingToIccid,omitempty"`
+	LastUpdated      time.Time `json:"lastUpdated,omitempty"`
 }
 
 type PhoneNumber struct {
@@ -108,6 +113,7 @@ type Snapshot struct {
 	PSAttached         bool        `json:"psAttached"`
 	IMEI               string      `json:"imei"`
 	ICCID              string      `json:"iccid"`
+	SwitchingToICCID   string      `json:"switchingToIccid,omitempty"`
 	IMSI               string      `json:"imsi"`
 	SPN                string      `json:"spn,omitempty"`
 	MNCLength          int         `json:"mncLength,omitempty"`

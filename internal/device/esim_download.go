@@ -286,9 +286,18 @@ func readEsimChipInfo(ctx context.Context, channel *euiccChannel, aidHex string)
 // the inserted card. It is entirely read-only: only SELECT, GetProfilesInfo,
 // GetEuiccData, GetEuiccInfo2 and GetEuiccConfiguredAddresses are issued.
 func (manager *Manager) ESIMInventory(ctx context.Context, id string) ([]EsimInventoryEntry, error) {
+	if manager.esimSwitchInFlight(id) {
+		if cached, ok := manager.cachedESIMInventory(id); ok {
+			return cached, nil
+		}
+		return nil, errESIMRecovering
+	}
 	manager.lockESIM()
 	defer manager.unlockESIM()
-	if manager.esimRecoveryActive(id) {
+	if manager.esimSwitchInFlight(id) || manager.esimRecoveryActive(id) {
+		if cached, ok := manager.cachedESIMInventory(id); ok {
+			return cached, nil
+		}
 		return nil, errESIMRecovering
 	}
 
@@ -321,6 +330,37 @@ func (manager *Manager) ESIMInventory(ctx context.Context, id string) ([]EsimInv
 		}
 		return nil, ErrNoEUICC
 	}
+	manager.cacheESIMInventory(id, entries)
 	manager.cacheActiveESIMProfileName(id, entries)
 	return entries, nil
+}
+
+func cloneESIMInventory(entries []EsimInventoryEntry) []EsimInventoryEntry {
+	cloned := make([]EsimInventoryEntry, len(entries))
+	for index, entry := range entries {
+		cloned[index] = entry
+		cloned[index].Info = cloneESIMInfo(entry.Info)
+		cloned[index].Chip.Certificates = append([]string(nil), entry.Chip.Certificates...)
+		cloned[index].Chip.TrustedCIs = append([]string(nil), entry.Chip.TrustedCIs...)
+	}
+	return cloned
+}
+
+func (manager *Manager) cacheESIMInventory(id string, entries []EsimInventoryEntry) {
+	manager.esimCacheMu.Lock()
+	if manager.esimInventoryCache == nil {
+		manager.esimInventoryCache = make(map[string][]EsimInventoryEntry)
+	}
+	manager.esimInventoryCache[id] = cloneESIMInventory(entries)
+	manager.esimCacheMu.Unlock()
+}
+
+func (manager *Manager) cachedESIMInventory(id string) ([]EsimInventoryEntry, bool) {
+	manager.esimCacheMu.RLock()
+	entries, ok := manager.esimInventoryCache[id]
+	manager.esimCacheMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return cloneESIMInventory(entries), true
 }

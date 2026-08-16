@@ -59,6 +59,13 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 		esimUnavailable(w)
 		return true
 	case "actions":
+		if len(rest) == 3 && rest[1] == "switch" && rest[2] == "stream" {
+			if !requireMethod(w, r, http.MethodGet) {
+				return true
+			}
+			s.handleEsimSwitchStream(w, r, configID, physicalID, physicalPresent)
+			return true
+		}
 		if len(rest) == 2 && rest[1] == "switch" {
 			if !requireMethod(w, r, http.MethodPost) {
 				return true
@@ -345,21 +352,45 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 	// which normally takes longer than the server's ordinary response deadline.
 	controller := http.NewResponseController(w)
 	_ = controller.SetWriteDeadline(time.Time{})
-	transaction, err := s.quiesceVoWiFiForESIMTransaction(r.Context(), configID)
-	if err != nil {
-		writeError(w, http.StatusConflict, "vowifi_quiesce_failed", err.Error())
+	if err := s.runESIMSwitch(r.Context(), configID, physicalID, iccid, request.AIDHex, nil); err != nil {
+		s.writeESIMSwitchError(w, err)
 		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "switched", "iccid": iccid, "verified": true}})
+}
+
+type esimSwitchFailure struct {
+	stage string
+	err   error
+}
+
+func (failure *esimSwitchFailure) Error() string { return failure.err.Error() }
+func (failure *esimSwitchFailure) Unwrap() error { return failure.err }
+
+// runESIMSwitch is the single transaction used by both the legacy JSON POST
+// and the progress SSE endpoint. progress is invoked only by the device layer;
+// quiesce, subscriber guarding, rollback and per-card policy are identical.
+func (s *Server) runESIMSwitch(
+	ctx context.Context,
+	configID string,
+	physicalID string,
+	iccid string,
+	aidHex string,
+	progress func(device.EsimProgress),
+) error {
+	transaction, err := s.quiesceVoWiFiForESIMTransaction(ctx, configID)
+	if err != nil {
+		return &esimSwitchFailure{stage: "quiesce", err: err}
 	}
 	if transaction != nil && transaction.physicalID == "" {
 		transaction.physicalID = physicalID
 	}
-	releaseSubscriberChange, err := s.beginVoWiFiSubscriberChange(r.Context(), configID)
+	releaseSubscriberChange, err := s.beginVoWiFiSubscriberChange(ctx, configID)
 	if err != nil {
 		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
 			s.logger.Error("restore VoWiFi after subscriber guard failure", "device_id", configID, "error", restoreErr)
 		}
-		writeError(w, http.StatusConflict, "vowifi_subscriber_change_failed", err.Error())
-		return
+		return &esimSwitchFailure{stage: "subscriber_guard", err: err}
 	}
 	released := false
 	defer func() {
@@ -367,29 +398,95 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 			releaseSubscriberChange()
 		}
 	}()
-	if err := s.devices.ESIMSwitchProfile(r.Context(), physicalID, iccid, request.AIDHex); err != nil {
+	var switchErr error
+	if progressController, ok := s.devices.(esimProgressDeviceController); ok && progress != nil {
+		switchErr = progressController.ESIMSwitchProfileWithProgress(ctx, physicalID, iccid, aidHex, progress)
+	} else {
+		switchErr = s.devices.ESIMSwitchProfile(ctx, physicalID, iccid, aidHex)
+	}
+	if switchErr != nil {
 		// The runtime guard blocks all new VoWiFi work, so release it before
-		// restoring the old card.  A failed modem preflight must be invisible to
-		// the user: the old policy and live session are restored as one operation.
+		// restoring the old card. A failed preflight must be invisible to users.
 		releaseSubscriberChange()
 		released = true
 		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
 			s.logger.Error("restore VoWiFi after failed eSIM switch", "device_id", configID, "error", restoreErr)
 		}
-		s.writeDeviceError(w, err)
-		return
+		return &esimSwitchFailure{stage: "device", err: switchErr}
 	}
-	// The device layer verifies the requested ICCID before returning.  The guard
-	// can now be released; the target card's saved strategy is then reconciled
-	// before acknowledging the switch to the caller.
+	// The device layer verifies the requested ICCID before returning. Reconcile
+	// the target card's stored policy only after that proof is available.
 	releaseSubscriberChange()
 	released = true
-	if err := s.applyESIMCardPolicy(r.Context(), configID, physicalID, iccid); err != nil {
+	if err := s.applyESIMCardPolicy(ctx, configID, physicalID, iccid); err != nil {
 		s.logger.Error("apply target card policy after eSIM switch", "device_id", configID, "iccid", iccid, "error", err)
-		writeError(w, http.StatusConflict, "card_policy_apply_failed", err.Error())
+		return &esimSwitchFailure{stage: "policy", err: err}
+	}
+	return nil
+}
+
+func (s *Server) writeESIMSwitchError(w http.ResponseWriter, err error) {
+	var failure *esimSwitchFailure
+	if errors.As(err, &failure) {
+		switch failure.stage {
+		case "quiesce":
+			writeError(w, http.StatusConflict, "vowifi_quiesce_failed", failure.Error())
+			return
+		case "subscriber_guard":
+			writeError(w, http.StatusConflict, "vowifi_subscriber_change_failed", failure.Error())
+			return
+		case "policy":
+			writeError(w, http.StatusConflict, "card_policy_apply_failed", failure.Error())
+			return
+		case "device":
+			s.writeDeviceError(w, failure.err)
+			return
+		}
+	}
+	s.writeDeviceError(w, err)
+}
+
+// handleEsimSwitchStream is the interactive GET+SSE variant. The operation
+// context is detached from the HTTP request so closing the browser does not
+// cancel the card-side reset/verification transaction.
+func (s *Server) handleEsimSwitchStream(w http.ResponseWriter, r *http.Request, configID, physicalID string, physicalPresent bool) {
+	if s.devices == nil {
+		writeError(w, http.StatusServiceUnavailable, "device_manager_unavailable", "device manager is unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "switched", "iccid": iccid, "verified": true}})
+	if !physicalPresent {
+		writeError(w, http.StatusServiceUnavailable, "physical_device_missing", "the configured modem is not present on this Linux host")
+		return
+	}
+	iccid := strings.TrimSpace(r.URL.Query().Get("iccid"))
+	if iccid == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "iccid is required")
+		return
+	}
+	aidHex := r.URL.Query().Get("aid_hex")
+	controller := beginSSE(w)
+	if err := writeSSEEvent(w, controller, "connected", map[string]any{}); err != nil {
+		return
+	}
+	sawDone := false
+	emit := func(p device.EsimProgress) {
+		if p.Step == "done" {
+			sawDone = true
+		}
+		_ = writeSSEEvent(w, controller, "progress", map[string]any{"step": p.Step, "msg": p.Msg, "pct": p.Pct})
+	}
+	operationContext := context.WithoutCancel(r.Context())
+	if err := s.runESIMSwitch(operationContext, configID, physicalID, iccid, aidHex, emit); err != nil {
+		_ = writeSSEEvent(w, controller, "progress", map[string]any{
+			"step": "error", "msg": "切卡失败: " + err.Error(), "pct": -1, "code": "esim_switch_failed",
+		})
+		return
+	}
+	// The device manager emits done; emit a fallback for legacy controller
+	// implementations that only expose the original DeviceController method.
+	if !sawDone {
+		_ = writeSSEEvent(w, controller, "progress", map[string]any{"step": "done", "msg": "Profile 切换完成", "pct": 100})
+	}
 }
 
 // esimVoWiFiTransaction captures the state changed while a profile switch is

@@ -31,8 +31,11 @@ type Manager struct {
 	esimMu                        sync.Mutex // serializes eSIM card access (list/switch/download)
 	esimRecoveryMu                sync.Mutex
 	esimRecoveries                map[string]chan struct{}
+	esimSwitchMu                  sync.RWMutex
+	esimSwitchTargets             map[string]string // device id -> in-flight target ICCID
 	esimCacheMu                   sync.RWMutex
 	esimCache                     map[string]EsimInfo
+	esimInventoryCache            map[string][]EsimInventoryEntry
 	esimActiveName                map[string]string
 	discoverer                    modem.Discoverer
 	opener                        modem.Opener
@@ -138,7 +141,9 @@ func NewManager(options Options) (*Manager, error) {
 		devices:                       make(map[string]*managedDevice),
 		ussdSessions:                  make(map[string]ussdSession),
 		esimRecoveries:                make(map[string]chan struct{}),
+		esimSwitchTargets:             make(map[string]string),
 		esimCache:                     make(map[string]EsimInfo),
+		esimInventoryCache:            make(map[string][]EsimInventoryEntry),
 		esimActiveName:                make(map[string]string),
 	}, nil
 }
@@ -315,7 +320,7 @@ func (manager *Manager) List() []Device {
 	manager.mu.RLock()
 	result := make([]Device, 0, len(manager.devices))
 	for id, state := range manager.devices {
-		result = append(result, copyDevice(id, state))
+		result = append(result, manager.copyDevice(id, state))
 	}
 	manager.mu.RUnlock()
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
@@ -329,26 +334,31 @@ func (manager *Manager) Get(id string) (Device, error) {
 		manager.mu.RUnlock()
 		return Device{}, ErrNotFound
 	}
-	result := copyDevice(id, state)
+	result := manager.copyDevice(id, state)
 	manager.mu.RUnlock()
 	return result, nil
 }
 
-func copyDevice(id string, state *managedDevice) Device {
+func (manager *Manager) copyDevice(id string, state *managedDevice) Device {
 	var snapshot *Snapshot
 	if state.snapshot != nil {
 		value := *state.snapshot
 		value.Warnings = append([]string(nil), value.Warnings...)
 		snapshot = &value
 	}
+	switchTarget, _ := manager.esimSwitchTarget(id)
+	if snapshot != nil {
+		snapshot.SwitchingToICCID = switchTarget
+	}
 	return Device{
-		ID:          id,
-		Candidate:   copyCandidate(state.candidate),
-		Snapshot:    snapshot,
-		LastError:   state.lastError,
-		Discovered:  state.discovered,
-		Recovering:  state.recovering,
-		LastUpdated: state.lastUpdated,
+		ID:               id,
+		Candidate:        copyCandidate(state.candidate),
+		Snapshot:         snapshot,
+		LastError:        state.lastError,
+		Discovered:       state.discovered,
+		Recovering:       state.recovering,
+		SwitchingToICCID: switchTarget,
+		LastUpdated:      state.lastUpdated,
 	}
 }
 

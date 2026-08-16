@@ -110,6 +110,7 @@ export interface DeviceListItem {
   radioRegistered?: boolean;
   lifecyclePhase?: string;
   lifecycleReason?: string;
+  switchingToIccid?: string;
   publicIp: string;
   privateIp?: string;
   interface: string;
