@@ -67,6 +67,28 @@ type Config struct {
 	// OnSMSStatus is invoked for an SMS-STATUS-REPORT received after a
 	// submission that requested a delivery report.
 	OnSMSStatus func(context.Context, ReceivedSMSStatus) error
+	// OnSMSDeliveryReport observes the RP-ACK/RP-ERROR returned for an inbound
+	// SMS. The service centre redelivers the message until it is satisfied by
+	// that report, so a failing report is the difference between one SMS and
+	// the same SMS six times. It is diagnostic only: the report is best-effort
+	// either way, and the callback must not block.
+	OnSMSDeliveryReport func(context.Context, SMSDeliveryReport)
+}
+
+// SMSDeliveryReport records how the acknowledgement for one inbound SMS fared.
+type SMSDeliveryReport struct {
+	DeviceID    string
+	CallID      string
+	RPReference int
+	// Kind is "ack" for RP-ACK or "error" for RP-ERROR.
+	Kind string
+	// Target is the URI the report was sent to, empty when the inbound message
+	// carried neither a P-Asserted-Identity nor a From URI to answer.
+	Target string
+	// StatusCode is the SIP status of the report transaction, or 0 when no
+	// response arrived.
+	StatusCode int
+	Error      string
 }
 
 // Provider implements vowifi.IMSProvider using a small RFC 3261 REGISTER

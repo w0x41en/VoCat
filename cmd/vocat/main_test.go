@@ -13,6 +13,8 @@ import (
 	"vocat/internal/device"
 	"vocat/internal/modem"
 	"vocat/internal/store"
+	"vocat/internal/vowifi/ims"
+	"vocat/internal/vowifi/integration"
 )
 
 // fakeModemClient is a minimal scripted modem.Client for exercising the region
@@ -410,5 +412,58 @@ func TestVoWiFiCarrierConfigsUseCompatibleDefaults(t *testing.T) {
 	}
 	if sip.Transport != "tcp" || sip.SMSCenter != "" || sip.RequireExplicitIdentities {
 		t.Fatalf("default IMS config = %#v", sip)
+	}
+}
+
+// A service centre redelivers an unacknowledged SMS in a fresh SIP transaction,
+// so the Call-ID differs while the TPDU is byte-identical. Six copies of one
+// DITO message reached the inbox that way before the identity became stable.
+func TestVoWiFiReceivedSMSCollapsesServiceCentreRedeliveries(t *testing.T) {
+	database := newRegionTestStore(t)
+	deviceConfig := store.Device{ID: "wwan0", Name: "410"}
+	rawTPDU := "200BD0D6A733782C020008628061903213000441424344"
+	delivery := func(callID string) ims.ReceivedSMS {
+		return ims.ReceivedSMS{
+			MessageID: "ims:" + callID + ":0",
+			DeviceID:  deviceConfig.ID,
+			IMSI:      "515661000061889",
+			From:      "VONAGE",
+			Text:      "your code is 923320",
+			Timestamp: time.Now().UTC(),
+			RawTPDU:   rawTPDU,
+			CallID:    callID,
+		}
+	}
+	for _, callID := range []string{"asbc157/A@one", "asbc811/B@two", "asbc603/C@three"} {
+		if err := persistVoWiFiReceivedSMS(
+			context.Background(), database, integration.ATMapper{Store: database}, deviceConfig, delivery(callID),
+		); err != nil {
+			t.Fatalf("persistVoWiFiReceivedSMS(%s): %v", callID, err)
+		}
+	}
+
+	messages, err := database.ListInboundSMSAfterID(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatalf("ListInboundSMSAfterID: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("stored %d rows for one redelivered SMS, want 1", len(messages))
+	}
+
+	// A genuinely different message from the same sender keeps its own row: the
+	// service centre timestamp inside the TPDU differs even when the text does.
+	other := delivery("asbc999/D@four")
+	other.RawTPDU = "200BD0D6A733782C020008628061904230000441424344"
+	if err := persistVoWiFiReceivedSMS(
+		context.Background(), database, integration.ATMapper{Store: database}, deviceConfig, other,
+	); err != nil {
+		t.Fatalf("persistVoWiFiReceivedSMS(distinct): %v", err)
+	}
+	messages, err = database.ListInboundSMSAfterID(context.Background(), 0, 100)
+	if err != nil {
+		t.Fatalf("ListInboundSMSAfterID: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("stored %d rows for two distinct deliveries, want 2", len(messages))
 	}
 }

@@ -636,19 +636,47 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 }
 
 func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) {
+	outcome := SMSDeliveryReport{
+		DeviceID: session.request.DeviceID,
+		CallID:   strings.TrimSpace(request.value("Call-ID")),
+		Kind:     "ack",
+	}
+	if len(report) >= 2 {
+		outcome.RPReference = int(report[1])
+		if report[0] != 0x02 {
+			outcome.Kind = "error"
+		}
+	}
 	target := firstURI(request.value("P-Asserted-Identity"))
 	if target == "" {
 		target = firstURI(request.value("From"))
 	}
+	outcome.Target = target
 	if target == "" {
+		outcome.Error = "inbound message carried no address to acknowledge"
+		session.reportSMSDelivery(outcome)
 		return
 	}
-	_, _ = session.sendSIPMessage(
+	response, err := session.sendSIPMessage(
 		context.Background(),
 		target,
 		report,
-		strings.TrimSpace(request.value("Call-ID")),
+		outcome.CallID,
 	)
+	if err != nil {
+		outcome.Error = err.Error()
+	}
+	if response != nil {
+		outcome.StatusCode = response.StatusCode
+	}
+	session.reportSMSDelivery(outcome)
+}
+
+func (session *Session) reportSMSDelivery(outcome SMSDeliveryReport) {
+	if session.provider.config.OnSMSDeliveryReport == nil {
+		return
+	}
+	session.provider.config.OnSMSDeliveryReport(context.Background(), outcome)
 }
 
 func (session *Session) SendSMS(ctx context.Context, request vowifi.SMSSubmitRequest) (vowifi.SMSSubmitResult, error) {

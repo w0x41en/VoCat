@@ -866,7 +866,14 @@ func persistVoWiFiReceivedSMS(
 	if message.Concat != nil && message.Concat.Total > 0 {
 		partsTotal = message.Concat.Total
 	}
-	messageID := message.MessageID
+	// A service centre that is not satisfied with the delivery report redelivers
+	// the same SMS-DELIVER for many minutes, each time in a fresh SIP
+	// transaction. Addressing a single-segment message by its Call-ID therefore
+	// stored one row per redelivery — six copies of one message were observed on
+	// DITO. TS 23.040 duplicate detection is defined on the message itself, and
+	// the TPDU carries the originating address and the service centre timestamp,
+	// so two byte-identical TPDUs for one subscriber are the same delivery.
+	messageID := fmt.Sprintf("ims:%s:tpdu:%x", message.IMSI, segmentDigest)
 	if message.Concat != nil && message.Concat.Total > 1 {
 		// A segment of a carrier-split long SMS over IMS. Address the whole
 		// message with a stable id so SaveSMSMessage folds every segment into
@@ -1050,6 +1057,24 @@ func newVoWiFiOrchestrator(
 		},
 		OnSMSStatus: func(ctx context.Context, report ims.ReceivedSMSStatus) error {
 			return persistVoWiFiSMSStatus(ctx, database, mapper, deviceConfig, report)
+		},
+		OnSMSDeliveryReport: func(_ context.Context, outcome ims.SMSDeliveryReport) {
+			attributes := []any{
+				"category", "sms", "event", "ims_sms_delivery_report",
+				"device_id", outcome.DeviceID, "kind", outcome.Kind,
+				"call_id", outcome.CallID, "rp_reference", outcome.RPReference,
+				"target", outcome.Target, "sip_status", outcome.StatusCode,
+			}
+			if outcome.Error != "" {
+				attributes = append(attributes, "error", outcome.Error)
+			}
+			// An unacknowledged delivery is the reason a service centre keeps
+			// redelivering, so it is a warning even though nothing failed locally.
+			if outcome.Error != "" || outcome.StatusCode < 200 || outcome.StatusCode >= 300 {
+				logger.Warn("IMS SMS delivery report was not accepted", attributes...)
+				return
+			}
+			logger.Info("IMS SMS delivery report accepted", attributes...)
 		},
 	})
 	if err != nil {

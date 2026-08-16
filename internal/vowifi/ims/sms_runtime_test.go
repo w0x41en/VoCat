@@ -1017,3 +1017,77 @@ func serveOutboundSMS(listener *net.UDPConn, nonce string, readyForClose chan<- 
 	_, err = listener.WriteToUDP(testResponse(200, "OK", registerCallID, headers["cseq"], nil), remote)
 	return err
 }
+
+// A delivery report that never reaches the service centre is why the same SMS
+// arrives again minutes later, so its outcome must be observable rather than
+// discarded.
+func TestInboundSMSDeliveryReportOutcomeIsReported(t *testing.T) {
+	tpdu := []byte{
+		0x04, 0x05, 0x91, 0x21, 0x43, 0xf5, 0x00, 0x00,
+		0x42, 0x10, 0x20, 0x30, 0x40, 0x50, 0x00, 0x05,
+		0xc8, 0x22, 0x93, 0xf9, 0x04,
+	}
+	newSession := func(reports chan SMSDeliveryReport) *Session {
+		return &Session{
+			provider: &Provider{config: Config{
+				TransactionTimeout: 50 * time.Millisecond,
+				OnSMS:              func(context.Context, ReceivedSMS) error { return nil },
+				OnSMSDeliveryReport: func(_ context.Context, outcome SMSDeliveryReport) {
+					reports <- outcome
+				},
+			}},
+			request: vowifi.IMSRequest{
+				DeviceID: "wwan0",
+				Identity: vowifi.SIMIdentity{IMSI: "515661000061889"},
+			},
+			identity:     identitySet{public: "sip:515661000061889@example.test", domain: "example.test"},
+			endpoint:     pcscfEndpoint{host: "127.0.0.1", port: 5060},
+			transport:    "tcp",
+			conn:         &recordingSIPConn{},
+			fromTag:      "local",
+			cseq:         1,
+			transactions: make(map[sipTransactionKey]chan *sipResponse),
+			smsServer:    make(map[smsServerTransactionKey]*smsServerTransaction),
+		}
+	}
+	rpdu := append([]byte{0x01, 0x2a, 0x00, 0x00, byte(len(tpdu))}, tpdu...)
+
+	t.Run("unanswered report is reported as a failure", func(t *testing.T) {
+		reports := make(chan SMSDeliveryReport, 1)
+		session := newSession(reports)
+		session.handleSIPRequest(smsTestRequest("deliver-unanswered", 1, rpdu), func([]byte) error { return nil })
+		select {
+		case outcome := <-reports:
+			if outcome.Kind != "ack" || outcome.RPReference != 0x2a || outcome.DeviceID != "wwan0" {
+				t.Fatalf("outcome = %#v", outcome)
+			}
+			if outcome.Error == "" || outcome.StatusCode != 0 {
+				t.Fatalf("an unanswered report must surface an error: %#v", outcome)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("delivery report outcome was never reported")
+		}
+	})
+
+	t.Run("unaddressable report is reported without being sent", func(t *testing.T) {
+		reports := make(chan SMSDeliveryReport, 1)
+		session := newSession(reports)
+		// An inbound MESSAGE with nothing to answer never reaches the network,
+		// and silently dropping it would look identical to a delivered ack.
+		request := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+			"call-id": {"deliver-unaddressable"},
+		}}
+		session.sendDeliveryReport(request, []byte{0x02, 0x2a})
+		select {
+		case outcome := <-reports:
+			if outcome.Target != "" || outcome.Error == "" || outcome.StatusCode != 0 {
+				t.Fatalf("outcome = %#v", outcome)
+			}
+			if outcome.CallID != "deliver-unaddressable" || outcome.Kind != "ack" {
+				t.Fatalf("outcome = %#v", outcome)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("delivery report outcome was never reported")
+		}
+	})
+}
