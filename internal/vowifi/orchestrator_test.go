@@ -894,6 +894,77 @@ func TestRuntimeSIMChangeRevokesOldSubscriberSMSWithoutRetry(t *testing.T) {
 	t.Fatalf("timed out waiting for SIM identity revocation; state=%+v", orchestrator.State())
 }
 
+func TestRuntimeIMSIFlapOnStableCardDoesNotRevokeSession(t *testing.T) {
+	environment := newFakeEnvironment()
+	orchestrator := newTestOrchestratorWithOptions(t, environment, Options{
+		DeviceID:              "EC20",
+		CleanupTimeout:        time.Second,
+		IdentityCheckInterval: 5 * time.Millisecond,
+		IdentityFlapTolerance: 50 * time.Millisecond,
+	})
+	if _, err := orchestrator.Enable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotate the IMSI and home PLMN away from the baseline while the ICCID stays
+	// fixed — the multi-IMSI card signature.
+	changed := environment.identity
+	changed.IMSI = "204047495061889"
+	changed.HomeMCC = "204"
+	changed.HomeMNC = "04"
+	environment.setIdentity(changed)
+	time.Sleep(20 * time.Millisecond)
+
+	// The flap reverts well inside the tolerance window.
+	reverted := environment.identity
+	reverted.IMSI = "234150000000000"
+	reverted.HomeMCC = "234"
+	reverted.HomeMNC = "15"
+	environment.setIdentity(reverted)
+	time.Sleep(20 * time.Millisecond)
+
+	state := orchestrator.State()
+	if state.LastReason == "runtime_sim_identity_changed" {
+		t.Fatalf("IMSI flap on a stable ICCID tore the session down: %+v", state)
+	}
+	if state.Phase == PhaseIdle || !state.Active || !state.IMSReady || !state.SMSReady {
+		t.Fatalf("session did not survive IMSI flap: %+v", state)
+	}
+	if environment.callCount("ims.close") != 0 || environment.callCount("tunnel.close") != 0 {
+		t.Fatalf("IMSI flap closed IMS/tunnel: calls=%#v", environment.callsSnapshot())
+	}
+}
+
+func TestRuntimeDurableIMSIChangeRevokesSessionAfterTolerance(t *testing.T) {
+	environment := newFakeEnvironment()
+	orchestrator := newTestOrchestratorWithOptions(t, environment, Options{
+		DeviceID:              "EC20",
+		CleanupTimeout:        time.Second,
+		IdentityCheckInterval: 5 * time.Millisecond,
+		IdentityFlapTolerance: 30 * time.Millisecond,
+	})
+	if _, err := orchestrator.Enable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A durable profile switch (never reverts) must still tear down once the
+	// tolerance elapses.
+	changed := environment.identity
+	changed.IMSI = "204047495061889"
+	changed.HomeMCC = "204"
+	changed.HomeMNC = "04"
+	environment.setIdentity(changed)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if orchestrator.State().LastReason == "runtime_sim_identity_changed" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("durable IMSI change was not revoked; state=%+v", orchestrator.State())
+}
+
 func TestSendSMSRechecksLiveSIMIdentityAndRevokesStaleSession(t *testing.T) {
 	environment := newFakeEnvironment()
 	orchestrator := newTestOrchestrator(t, environment, false)

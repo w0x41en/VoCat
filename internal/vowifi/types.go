@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -445,6 +446,18 @@ type Options struct {
 	// IMS session is active. A detected SIM/profile change tears down the old
 	// subscriber session and revokes SMS readiness instead of auto-retrying it.
 	IdentityCheckInterval time.Duration
+	// IdentityFlapTolerance is how long an IMSI/PLMN drift (with the ICCID still
+	// stable) may persist before the watchdog treats it as a durable profile
+	// switch and tears the session down. A multi-IMSI card rotates EF_IMSI on a
+	// local timer and reverts within its rotation period, so a tolerance larger
+	// than that period keeps the session alive through the flap while a genuine
+	// profile switch still rebuilds. Zero disables tolerance: any IMSI/PLMN
+	// change tears down immediately, matching the pre-flap-tolerance behavior.
+	IdentityFlapTolerance time.Duration
+	// Logger receives diagnostic records from the runtime identity watchdog and
+	// other background monitors. It is optional; when nil, no watchdog logging
+	// is emitted.
+	Logger *slog.Logger
 }
 
 func (options Options) validate() error {
@@ -456,6 +469,9 @@ func (options Options) validate() error {
 	}
 	if options.IdentityCheckInterval < 0 {
 		return errors.New("vowifi: identity check interval must not be negative")
+	}
+	if options.IdentityFlapTolerance < 0 {
+		return errors.New("vowifi: identity flap tolerance must not be negative")
 	}
 	return nil
 }

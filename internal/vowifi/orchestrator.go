@@ -940,9 +940,12 @@ func (orchestrator *Orchestrator) watchRuntimeIdentity(
 	wantICCID := strings.TrimSpace(identity.ICCID)
 	wantIMSI := strings.TrimSpace(identity.IMSI)
 	wantProfile := ResolveCarrierProfile(identity)
+	logger := orchestrator.options.Logger
+	deviceID := orchestrator.options.DeviceID
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		var driftSince time.Time
 		for {
 			select {
 			case <-runtimeContext.Done():
@@ -952,22 +955,111 @@ func (orchestrator *Orchestrator) watchRuntimeIdentity(
 			checkContext, cancel := context.WithTimeout(runtimeContext, interval)
 			current, err := orchestrator.deps.SIM.ReadIdentity(
 				checkContext,
-				orchestrator.options.DeviceID,
+				deviceID,
 			)
 			cancel()
 			if err != nil {
 				// A transient read failure is not proof that the subscriber changed.
-				// Existing tunnel/IMS failure monitors remain authoritative.
+				// Existing tunnel/IMS failure monitors remain authoritative. Log it so
+				// a recurring read failure — which the watchdog deliberately ignores —
+				// is not mistaken for a healthy session.
+				if logger != nil {
+					logger.Warn("VoWiFi identity watchdog read failed",
+						"category", "vowifi", "event", "identity_watchdog_read_failed",
+						"device_id", deviceID, "error", err.Error())
+				}
 				continue
 			}
 			gotICCID := strings.TrimSpace(current.ICCID)
 			gotIMSI := strings.TrimSpace(current.IMSI)
 			gotProfile := ResolveCarrierProfile(current)
-			if (wantICCID != "" && gotICCID != "" && !strings.EqualFold(wantICCID, gotICCID)) ||
-				(wantIMSI != "" && gotIMSI != "" && wantIMSI != gotIMSI) ||
-				(wantProfile.PLMN != "" && gotProfile.PLMN != "" && wantProfile.PLMN != gotProfile.PLMN) {
+			iccidChanged := wantICCID != "" && gotICCID != "" && !strings.EqualFold(wantICCID, gotICCID)
+			imsiChanged := wantIMSI != "" && gotIMSI != "" && wantIMSI != gotIMSI
+			plmnChanged := wantProfile.PLMN != "" && gotProfile.PLMN != "" && wantProfile.PLMN != gotProfile.PLMN
+			// A real SIM swap is always the ICCID changing: revoke immediately.
+			if iccidChanged {
+				if logger != nil {
+					logger.Warn("VoWiFi identity watchdog detected a subscriber change",
+						"category", "vowifi", "event", "identity_watchdog_changed",
+						"device_id", deviceID,
+						"iccid_changed", iccidChanged,
+						"want_iccid", wantICCID, "got_iccid", gotICCID,
+						"want_imsi", wantIMSI, "got_imsi", gotIMSI,
+						"want_plmn", wantProfile.PLMN, "got_plmn", gotProfile.PLMN,
+					)
+				}
 				orchestrator.revokeChangedIdentityRuntime(resources)
 				return
+			}
+			if !(imsiChanged || plmnChanged) {
+				// Identity matches the session baseline. If it had drifted and now
+				// reverted, that drift was a multi-IMSI flap, not a profile switch.
+				if !driftSince.IsZero() {
+					driftSince = time.Time{}
+					if logger != nil {
+						logger.Warn("VoWiFi identity watchdog observed IMSI/PLMN revert to the session baseline",
+							"category", "vowifi", "event", "identity_watchdog_imsi_flap_reverted",
+							"device_id", deviceID,
+							"want_iccid", wantICCID, "got_iccid", gotICCID,
+							"want_imsi", wantIMSI, "got_imsi", gotIMSI,
+							"want_plmn", wantProfile.PLMN, "got_plmn", gotProfile.PLMN,
+						)
+					}
+				}
+				continue
+			}
+			// IMSI/PLMN drifted while the ICCID is stable: either a multi-IMSI
+			// flap (which reverts within its rotation period) or a durable profile
+			// switch. Defer the decision for the configured tolerance window.
+			tolerance := orchestrator.options.IdentityFlapTolerance
+			if tolerance <= 0 {
+				if logger != nil {
+					logger.Warn("VoWiFi identity watchdog detected an IMSI/PLMN change",
+						"category", "vowifi", "event", "identity_watchdog_changed",
+						"device_id", deviceID,
+						"iccid_changed", iccidChanged,
+						"imsi_changed", imsiChanged,
+						"plmn_changed", plmnChanged,
+						"want_iccid", wantICCID, "got_iccid", gotICCID,
+						"want_imsi", wantIMSI, "got_imsi", gotIMSI,
+						"want_plmn", wantProfile.PLMN, "got_plmn", gotProfile.PLMN,
+					)
+				}
+				orchestrator.revokeChangedIdentityRuntime(resources)
+				return
+			}
+			if driftSince.IsZero() {
+				driftSince = time.Now()
+			}
+			if time.Since(driftSince) >= tolerance {
+				if logger != nil {
+					logger.Warn("VoWiFi identity watchdog detected a durable IMSI/PLMN change",
+						"category", "vowifi", "event", "identity_watchdog_changed",
+						"device_id", deviceID,
+						"iccid_changed", iccidChanged,
+						"imsi_changed", imsiChanged,
+						"plmn_changed", plmnChanged,
+						"want_iccid", wantICCID, "got_iccid", gotICCID,
+						"want_imsi", wantIMSI, "got_imsi", gotIMSI,
+						"want_plmn", wantProfile.PLMN, "got_plmn", gotProfile.PLMN,
+						"drift", time.Since(driftSince).String(),
+					)
+				}
+				orchestrator.revokeChangedIdentityRuntime(resources)
+				return
+			}
+			if logger != nil {
+				logger.Warn("VoWiFi identity watchdog observed an IMSI/PLMN flap on a stable card",
+					"category", "vowifi", "event", "identity_watchdog_imsi_flap",
+					"device_id", deviceID,
+					"iccid_changed", iccidChanged,
+					"imsi_changed", imsiChanged,
+					"plmn_changed", plmnChanged,
+					"want_iccid", wantICCID, "got_iccid", gotICCID,
+					"want_imsi", wantIMSI, "got_imsi", gotIMSI,
+					"want_plmn", wantProfile.PLMN, "got_plmn", gotProfile.PLMN,
+					"drift", time.Since(driftSince).String(),
+				)
 			}
 		}
 	}()
