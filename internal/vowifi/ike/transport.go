@@ -870,9 +870,49 @@ func ikeResponseMatchesRequest(
 	}
 	var zeroSPI [8]byte
 	if request.ResponderSPI == zeroSPI {
-		return response.ResponderSPI != zeroSPI
+		if response.ResponderSPI != zeroSPI {
+			return true
+		}
+		return isSAInitRejection(packet, request)
 	}
 	return response.ResponderSPI == request.ResponderSPI
+}
+
+// isSAInitRejection reports whether packet is an IKE_SA_INIT response carrying
+// nothing but fatal error notifications. RFC 7296 §2.21.1 returns those before
+// any IKE SA exists, so they echo the request's zero responder SPI; dropping
+// them turns a carrier that rejects our proposal — DITO answers every offer but
+// AES-CBC-128/SHA1/MODP-1024 with NO_PROPOSAL_CHOSEN — into an indistinguishable
+// UDP timeout. Anything else bearing a zero responder SPI (an SA/KE chain, a
+// status notify, an unrecognized error) is still ignored, so an off-path packet
+// cannot stand in for a real response.
+func isSAInitRejection(packet []byte, request ikeHeader) bool {
+	if request.Exchange != exchangeIKEInit || request.MessageID != 0 {
+		return false
+	}
+	header, body, err := parseIKEPacket(packet)
+	if err != nil {
+		return false
+	}
+	payloads, err := parsePayloadChain(header.NextPayload, body)
+	if err != nil || len(payloads) == 0 {
+		return false
+	}
+	for _, item := range payloads {
+		if item.Type != payloadNotify {
+			return false
+		}
+		kind, _, err := parseNotify(item)
+		if err != nil {
+			return false
+		}
+		switch kind {
+		case notifyNoProposal, notifyInvalidKE, notifyInvalidSyntax:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func marshalSOCKS5Datagram(remote *net.UDPAddr, payload []byte) ([]byte, error) {

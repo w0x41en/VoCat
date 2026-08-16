@@ -63,6 +63,7 @@ const (
 	notifyDeviceIdentity  = 41101
 	notifyInvalidKE       = 17
 	notifyNoProposal      = 14
+	notifyInvalidSyntax   = 7
 )
 
 var (

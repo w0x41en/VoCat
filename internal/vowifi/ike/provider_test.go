@@ -333,13 +333,19 @@ func TestProviderVodafoneFirstAuthIsEAPOnlyAndRequestsIMSAPN(t *testing.T) {
 	}
 }
 
-func TestProviderCarrierOverridesIKEIdentityType(t *testing.T) {
+func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
 	capture := &firstAuthCaptureTransport{t: t}
+	var traced IKEAuthTraceEvent
+	traceSeen := false
 	provider, err := NewProvider(Config{
 		Random:    constantReader{value: 0x42},
 		Timeout:   time.Second,
 		Installer: unusedInstaller{},
 		APN:       "ims",
+		IKETrace: func(event IKEAuthTraceEvent) {
+			traced = event
+			traceSeen = true
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -352,23 +358,35 @@ func TestProviderCarrierOverridesIKEIdentityType(t *testing.T) {
 	) (datagramTransport, error) {
 		return capture, nil
 	}
+	identity := vowifi.SIMIdentity{
+		ICCID:   "8944100000000000000",
+		IMSI:    "515021234567890",
+		HomeMCC: "515",
+		HomeMNC: "02",
+	}
 	_, err = provider.Start(context.Background(), vowifi.TunnelRequest{
 		DeviceID: "wwan0",
-		Identity: vowifi.SIMIdentity{
-			ICCID:   "8944100000000000000",
-			IMSI:    "515021234567890",
-			HomeMCC: "515",
-			HomeMNC: "02",
-		},
-		Carrier: vowifi.CarrierProfile{IKEIdentityType: 2},
-		EPDG:    "weconnect.globe.com.ph",
-		AKA:     &testAKAProvider{},
+		Identity: identity,
+		Carrier:  vowifi.ResolveCarrierProfile(identity),
+		EPDG:     "weconnect.globe.com.ph",
+		AKA:      &testAKAProvider{},
 	})
 	if !errors.Is(err, errFirstAuthObserved) {
 		t.Fatalf("Start() error = %v, want capture sentinel", err)
 	}
-	if capture.identityType != 2 {
-		t.Fatalf("carrier IKE identity type = %d, want USER_FQDN (2)", capture.identityType)
+	if capture.identityType != 3 {
+		t.Fatalf("Globe IKE identity type = %d, want RFC822_ADDR / NAI (3)", capture.identityType)
+	}
+	if !traceSeen || traced.MessageID != 1 || len(traced.Payloads) != 9 {
+		t.Fatalf("Globe initial IKE_AUTH trace = %#v", traced)
+	}
+	if traced.Payloads[0].IdentityPrefix != "051502" || traced.Payloads[1].IdentityValue != "ims" {
+		t.Fatalf("Globe initial IKE_AUTH identities = %#v", traced.Payloads[:2])
+	}
+	if !traced.SameIMSI || !traced.PermanentIdentityMatchesExpected ||
+		traced.ModemIMSIHash == "" || traced.ModemIMSIHash != traced.EAPIMSIHash ||
+		traced.ModemIMSILength != 15 || traced.EAPIMSILength != 15 {
+		t.Fatalf("Globe initial IKE_AUTH identity audit = %#v", traced)
 	}
 }
 
@@ -559,3 +577,48 @@ func TestProviderEAPMethodConfiguration(t *testing.T) {
 
 var _ io.Reader = constantReader{}
 var _ datagramTransport = (*firstAuthCaptureTransport)(nil)
+
+// TestProviderDITOPhilippinesNegotiatesLegacySuite pins the one suite DITO's
+// ePDG accepts. Every stronger offer is answered with NO_PROPOSAL_CHOSEN on
+// hardware, so the carrier preset — not just the per-device toggle — has to be
+// able to select SHA-1 and MODP-1024.
+func TestProviderDITOPhilippinesNegotiatesLegacySuite(t *testing.T) {
+	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true, useMODP1024: true}
+	provider, err := NewProvider(Config{
+		Random:    constantReader{value: 0x42},
+		Timeout:   time.Second,
+		Installer: unusedInstaller{},
+		APN:       "ims",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.transportFactory = func(
+		context.Context,
+		transportConfig,
+		vowifi.ProxyRoute,
+		string,
+	) (datagramTransport, error) {
+		return capture, nil
+	}
+	identity := vowifi.SIMIdentity{
+		ICCID:   "89636624020107210949",
+		IMSI:    "515661000061889",
+		HomeMCC: "515",
+		HomeMNC: "066",
+	}
+	carrier := vowifi.ResolveCarrierProfile(identity)
+	if !carrier.AllowSHA1 || !carrier.UseMODP1024 {
+		t.Fatalf("DITO carrier profile = %#v", carrier)
+	}
+	_, err = provider.Start(context.Background(), vowifi.TunnelRequest{
+		DeviceID: "openstick-1",
+		Identity: identity,
+		Carrier:  carrier,
+		EPDG:     "epdg.epc.mnc066.mcc515.pub.3gppnetwork.org",
+		AKA:      &testAKAProvider{},
+	})
+	if !errors.Is(err, errFirstAuthObserved) {
+		t.Fatalf("Start() error = %v, want capture sentinel", err)
+	}
+}

@@ -76,6 +76,15 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 	case "234015":
 		profile.PresetID = "Vodafone_uk_23415"
 		profile.Source = CarrierSourceBuiltin
+	case "515066":
+		// DITO Philippines accepts a single IKE suite on its ePDG:
+		// AES-CBC-128 with HMAC-SHA1 and MODP-1024. Every stronger offer is
+		// answered with NO_PROPOSAL_CHOSEN, so the legacy transforms are not
+		// a preference here but the only way to negotiate at all.
+		profile.PresetID = "DITO_PH_515066"
+		profile.Source = CarrierSourceBuiltin
+		profile.AllowSHA1 = true
+		profile.UseMODP1024 = true
 	case "515002":
 		// Globe Philippines publishes a dedicated static ePDG hostname rather
 		// than the standard PLMN-derived name. Keep the hostname here so DNS
@@ -83,7 +92,10 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		profile.PresetID = "Globe_PH_51502"
 		profile.Source = CarrierSourceBuiltin
 		profile.EPDG = "weconnect.globe.com.ph"
-		profile.IKEIdentityType = 2 // USER_FQDN / ID_FQDN
+		// The permanent EAP-AKA NAI is carried in IKE IDi as
+		// ID_RFC822_ADDR (type 3). ID_FQDN (type 2) is reserved for the
+		// requested APN in IDr below.
+		profile.IKEIdentityType = 3 // ID_RFC822_ADDR / NAI
 	}
 	return profile
 }

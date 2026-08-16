@@ -710,7 +710,7 @@ func configureVoWiFiRuntime(
 				activeAdapter = pcscAdapter
 				activeQMI = nil
 			}
-			return newVoWiFiOrchestrator(deviceConfig, database, mapper, activeAdapter, activeQMI)
+			return newVoWiFiOrchestrator(logger, deviceConfig, database, mapper, activeAdapter, activeQMI)
 		},
 	})
 
@@ -948,6 +948,7 @@ type vowifiDeviceAdapter interface {
 }
 
 func newVoWiFiOrchestrator(
+	logger *slog.Logger,
 	deviceConfig store.Device,
 	database *store.Store,
 	mapper integration.ATMapper,
@@ -968,6 +969,52 @@ func newVoWiFiOrchestrator(
 		radioController = qmiRadio
 	}
 	tunnelConfig, imsConfig := voWiFiCarrierConfigs(deviceConfig)
+	if logger != nil {
+		tunnelConfig.IKETrace = func(event ike.IKEAuthTraceEvent) {
+			logger.Info("VoWiFi IKE_AUTH trace",
+				"category", "vowifi",
+				"event", "ike_auth_trace",
+				"device_id", deviceConfig.ID,
+				"direction", event.Direction,
+				"exchange", event.Exchange,
+				"message_id", event.MessageID,
+				"modem_imsi_sha256", event.ModemIMSIHash,
+				"eap_imsi_sha256", event.EAPIMSIHash,
+				"modem_imsi_length", event.ModemIMSILength,
+				"eap_imsi_length", event.EAPIMSILength,
+				"same_imsi", event.SameIMSI,
+				"permanent_identity_matches_expected", event.PermanentIdentityMatchesExpected,
+				"expected_permanent_identity_length", event.ExpectedIdentityLength,
+				"payloads", event.Payloads,
+			)
+		}
+		tunnelConfig.EAPTrace = func(event ike.EAPTraceEvent) {
+			attributes := []any{
+				"category", "vowifi",
+				"event", "eap_trace",
+				"device_id", deviceConfig.ID,
+				"direction", event.Direction,
+				"length", event.Length,
+				"code", event.Code,
+				"identifier", event.Identifier,
+				"type_present", event.TypePresent,
+				"type", event.Type,
+				"subtype_present", event.SubtypePresent,
+				"subtype", event.Subtype,
+				"identity_length", event.IdentityLength,
+				"identity_sha256", event.IdentitySHA256,
+				"identity_has_nul", event.IdentityHasNUL,
+				"raw_hex_redacted", event.RawHexRedacted,
+			}
+			if event.ParseError != "" {
+				attributes = append(attributes, "parse_error", event.ParseError)
+			}
+			if len(event.Attributes) != 0 {
+				attributes = append(attributes, "aka_attributes", event.Attributes)
+			}
+			logger.Info("VoWiFi EAP trace", attributes...)
+		}
+	}
 	configuredID := strings.TrimSpace(deviceConfig.ID)
 	// Resolve the saved carrier/IMS settings at every new session boundary.
 	// This keeps a profile edit effective on the next reconnect without

@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/modem"
 )
@@ -19,6 +20,7 @@ type fakeNativeQMIRegistrationSession struct {
 	setPreferences   []qmi.SystemSelectionPreference
 	registerRequests []qmi.NASInitiateNetworkRegisterRequest
 	forceSearches    int
+	forceSearchErr   error
 	attachRequests   []bool
 	closeCount       int
 }
@@ -69,7 +71,7 @@ func (session *fakeNativeQMIRegistrationSession) InitiateNetworkRegister(_ conte
 
 func (session *fakeNativeQMIRegistrationSession) ForceNetworkSearch(context.Context) error {
 	session.forceSearches++
-	return nil
+	return session.forceSearchErr
 }
 
 func (session *fakeNativeQMIRegistrationSession) AttachDetach(_ context.Context, attached bool) error {
@@ -152,6 +154,20 @@ func TestQMIManualSelectionPreferenceMapsPLMN(t *testing.T) {
 	}
 }
 
+func TestQMIManualSelectionPreferenceStoresRAT(t *testing.T) {
+	rat := 7
+	pref, selection, err := qmiManualSelectionPreferenceWithRAT("515002", &rat)
+	if err != nil {
+		t.Fatalf("manual preference with RAT: %v", err)
+	}
+	if selection.MCC != 515 || selection.MNC != 2 || !selection.IncludesPCSDigit {
+		t.Fatalf("manual selection = %#v, want 515002", selection)
+	}
+	if !pref.HasModePreference || pref.ModePreference != qmi.NASRatModePreferenceLTE {
+		t.Fatalf("manual preference mode = %#v, want LTE mode preference", pref)
+	}
+}
+
 func TestEnsureNativeQMIRegistrationWaitsForManualTarget(t *testing.T) {
 	session := &fakeNativeQMIRegistrationSession{
 		mode: qmi.ModeOnline,
@@ -170,15 +186,58 @@ func TestEnsureNativeQMIRegistrationWaitsForManualTarget(t *testing.T) {
 	if err := ensureNativeQMIRegistrationForTarget(context.Background(), session, request, false, &target); err != nil {
 		t.Fatalf("ensure manual registration: %v", err)
 	}
-	if len(session.registerRequests) != 1 || session.registerRequests[0].Mode != qmi.NASNetworkRegisterManual ||
-		session.registerRequests[0].MCC != 460 || session.registerRequests[0].MNC != 1 {
-		t.Fatalf("registration requests = %#v, want one manual 46001 request", session.registerRequests)
+	if len(session.registerRequests) != 0 {
+		t.Fatalf("registration requests = %#v, want force-search trigger without direct register", session.registerRequests)
 	}
 	if session.forceSearches != 1 {
 		t.Fatalf("force-search count = %d, want 1", session.forceSearches)
 	}
 	if len(session.attachRequests) != 1 || !session.attachRequests[0] {
 		t.Fatalf("attach requests = %#v, want one attach", session.attachRequests)
+	}
+}
+
+func TestEnsureNativeQMIManualRegistrationFallsBackToServingRAT(t *testing.T) {
+	session := &fakeNativeQMIRegistrationSession{
+		mode: qmi.ModeOnline,
+		forceSearchErr: &qmi.QMIError{
+			Service:   qmi.ServiceNAS,
+			MessageID: qmi.NASForceNetworkSearch,
+			ErrorCode: qmi.QMIErrNotSupported,
+		},
+		serving: []*qmi.ServingSystem{
+			{RegistrationState: qmi.RegStateSearching, RadioInterface: 8},
+			{RegistrationState: qmi.RegStateRegistered, PSAttached: true, MCC: 460, MNC: 1},
+		},
+	}
+	request, err := qmiManualRegisterRequest("46001", nil)
+	if err != nil {
+		t.Fatalf("manual request: %v", err)
+	}
+	target := qmi.ManualNetworkSelection{MCC: 460, MNC: 1}
+	if err := ensureNativeQMIRegistrationForTarget(context.Background(), session, request, false, &target); err != nil {
+		t.Fatalf("ensure manual registration fallback: %v", err)
+	}
+	if len(session.registerRequests) != 1 || session.registerRequests[0].RadioAccessTech != 0x08 {
+		t.Fatalf("registration requests = %#v, want LTE fallback request", session.registerRequests)
+	}
+	if session.forceSearches != 1 {
+		t.Fatalf("force-search count = %d, want one unsupported attempt", session.forceSearches)
+	}
+}
+
+func TestRestoreNativeQMISelectionAfterFailure(t *testing.T) {
+	session := &fakeNativeQMIRegistrationSession{mode: qmi.ModeOnline}
+	manager := &Manager{longTimeout: time.Second}
+	manager.restoreNativeQMISelectionAfterFailure(session, "")
+	if len(session.setPreferences) != 1 || session.setPreferences[0].NetworkSelectionPreference != qmi.NASNetworkSelectionAutomatic {
+		t.Fatalf("rollback preferences = %#v, want automatic", session.setPreferences)
+	}
+	if len(session.registerRequests) != 1 || session.registerRequests[0].Mode != qmi.NASNetworkRegisterAutomatic {
+		t.Fatalf("rollback registrations = %#v, want automatic", session.registerRequests)
+	}
+	if session.forceSearches != 1 {
+		t.Fatalf("rollback force-search count = %d, want 1", session.forceSearches)
 	}
 }
 
@@ -220,6 +279,14 @@ func TestIsNativeQMICandidateRequiresOpenStickWWANPair(t *testing.T) {
 				QMIControl: "/dev/usb0qmi0",
 			},
 			want: false,
+		},
+		{
+			name: "mhi alias",
+			candidate: modem.Candidate{
+				ID:         "mhi-wwan0",
+				QMIControl: "/dev/wwan0qmi0",
+			},
+			want: true,
 		},
 	}
 	for _, tt := range tests {

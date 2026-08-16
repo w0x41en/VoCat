@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/modem"
 )

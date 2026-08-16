@@ -418,3 +418,122 @@ func isNetworkClose(err error) bool {
 	var networkError net.Error
 	return errors.As(err, &networkError)
 }
+
+// notifyPacket builds an IKE_SA_INIT response whose payload chain is the given
+// notify types, echoing the request's zero responder SPI the way RFC 7296
+// §2.21.1 requires for a rejection.
+func notifyPacket(t *testing.T, request ikeHeader, responderSPI [8]byte, messageID uint32, kinds ...uint16) []byte {
+	t.Helper()
+	payloads := make([]payload, 0, len(kinds))
+	for _, kind := range kinds {
+		body := []byte{0, 0, 0, 0}
+		binary.BigEndian.PutUint16(body[2:4], kind)
+		payloads = append(payloads, payload{Type: payloadNotify, Body: body})
+	}
+	first, body, err := marshalPayloadChain(payloads)
+	if err != nil {
+		t.Fatalf("marshalPayloadChain() error = %v", err)
+	}
+	return ikeHeader{
+		InitiatorSPI: request.InitiatorSPI,
+		ResponderSPI: responderSPI,
+		NextPayload:  first,
+		Exchange:     exchangeIKEInit,
+		MessageID:    messageID,
+		Flags:        flagResponse,
+	}.marshal(body)
+}
+
+func TestIKEResponseMatchesRequestAcceptsZeroSPIRejection(t *testing.T) {
+	request := ikeHeader{
+		InitiatorSPI: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		Exchange:     exchangeIKEInit,
+		Flags:        flagInitiator,
+	}
+	var zero [8]byte
+	cases := []struct {
+		name   string
+		packet []byte
+		want   bool
+	}{
+		{
+			name:   "no proposal chosen",
+			packet: notifyPacket(t, request, zero, 0, notifyNoProposal),
+			want:   true,
+		},
+		{
+			name:   "invalid KE payload",
+			packet: notifyPacket(t, request, zero, 0, notifyInvalidKE),
+			want:   true,
+		},
+		{
+			name:   "invalid syntax",
+			packet: notifyPacket(t, request, zero, 0, notifyInvalidSyntax),
+			want:   true,
+		},
+		{
+			name:   "established SA keeps its responder SPI",
+			packet: notifyPacket(t, request, [8]byte{9}, 0, notifyNoProposal),
+			want:   true,
+		},
+		{
+			name:   "status notify is not a rejection",
+			packet: notifyPacket(t, request, zero, 0, notifyNATSource),
+			want:   false,
+		},
+		{
+			name:   "unknown error code is not accepted",
+			packet: notifyPacket(t, request, zero, 0, 9999),
+			want:   false,
+		},
+		{
+			name:   "rejection mixed with a status notify",
+			packet: notifyPacket(t, request, zero, 0, notifyNoProposal, notifyMOBIKESupported),
+			want:   false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := ikeResponseMatchesRequest(testCase.packet, request); got != testCase.want {
+				t.Fatalf("ikeResponseMatchesRequest() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestIKEResponseMatchesRequestRejectsZeroSPIPayloadChain(t *testing.T) {
+	request := ikeHeader{
+		InitiatorSPI: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		Exchange:     exchangeIKEInit,
+		Flags:        flagInitiator,
+	}
+	first, body, err := marshalPayloadChain([]payload{
+		{Type: payloadSA, Body: []byte{0, 0, 0, 8, 1, 1, 0, 0}},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayloadChain() error = %v", err)
+	}
+	packet := ikeHeader{
+		InitiatorSPI: request.InitiatorSPI,
+		NextPayload:  first,
+		Exchange:     exchangeIKEInit,
+		Flags:        flagResponse,
+	}.marshal(body)
+	if ikeResponseMatchesRequest(packet, request) {
+		t.Fatal("a zero responder SPI carrying an SA payload must not be accepted")
+	}
+}
+
+func TestIKEResponseMatchesRequestRejectsZeroSPIOnLaterExchanges(t *testing.T) {
+	request := ikeHeader{
+		InitiatorSPI: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		Exchange:     exchangeIKEInit,
+		MessageID:    1,
+		Flags:        flagInitiator,
+	}
+	var zero [8]byte
+	packet := notifyPacket(t, request, zero, 1, notifyNoProposal)
+	if ikeResponseMatchesRequest(packet, request) {
+		t.Fatal("a zero responder SPI outside IKE_SA_INIT message 0 must not be accepted")
+	}
+}

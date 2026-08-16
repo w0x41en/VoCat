@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -66,6 +67,46 @@ type eapPacket struct {
 	Type       uint8
 	Data       []byte
 }
+
+// EAPTraceAttribute describes one EAP-AKA attribute without exposing the
+// subscriber identity bytes. It is intended for protocol diagnostics only.
+type EAPTraceAttribute struct {
+	Type              uint8  `json:"type"`
+	LengthUnits       uint8  `json:"length_units"`
+	WireLength        int    `json:"wire_length"`
+	ValueLength       int    `json:"value_length"`
+	IdentityLength    int    `json:"identity_length,omitempty"`
+	IdentitySHA256    string `json:"identity_sha256,omitempty"`
+	IdentityHasNUL    bool   `json:"identity_has_nul,omitempty"`
+	PaddingLength     int    `json:"padding_length,omitempty"`
+	PaddingHasNonZero bool   `json:"padding_has_nonzero,omitempty"`
+}
+
+// EAPTraceEvent contains the parsed EAP envelope and a redacted wire dump.
+// Identity bytes in RawHexRedacted are replaced with 0xaa; their exact length
+// and SHA-256 are retained so wire framing can be checked without persisting
+// an IMSI/NAI in the log store.
+type EAPTraceEvent struct {
+	Direction      string              `json:"direction"`
+	Length         int                 `json:"length"`
+	Code           uint8               `json:"code"`
+	Identifier     uint8               `json:"identifier"`
+	TypePresent    bool                `json:"type_present"`
+	Type           uint8               `json:"type,omitempty"`
+	SubtypePresent bool                `json:"subtype_present"`
+	Subtype        uint8               `json:"subtype,omitempty"`
+	ParseError     string              `json:"parse_error,omitempty"`
+	IdentityLength int                 `json:"identity_length,omitempty"`
+	IdentitySHA256 string              `json:"identity_sha256,omitempty"`
+	IdentityHasNUL bool                `json:"identity_has_nul,omitempty"`
+	RawHexRedacted string              `json:"raw_hex_redacted"`
+	Attributes     []EAPTraceAttribute `json:"attributes,omitempty"`
+}
+
+// EAPTraceCallback receives protocol diagnostics at each EAP RX/TX boundary.
+// Callers should treat the event as diagnostic data, not as an authentication
+// input, and must not add the unredacted subscriber identity to logs.
+type EAPTraceCallback func(EAPTraceEvent)
 
 func parseEAPPacket(encoded []byte) (eapPacket, error) {
 	if len(encoded) < 4 {
@@ -141,6 +182,91 @@ func parseAKAAttributes(encoded []byte) ([]akaAttribute, error) {
 		offset += length
 	}
 	return result, nil
+}
+
+func traceEAPPacket(direction string, encoded []byte) EAPTraceEvent {
+	event := EAPTraceEvent{
+		Direction:      direction,
+		Length:         len(encoded),
+		RawHexRedacted: hex.EncodeToString(encoded),
+	}
+	packet, err := parseEAPPacket(encoded)
+	if err != nil {
+		event.ParseError = err.Error()
+		return event
+	}
+	event.Code = packet.Code
+	event.Identifier = packet.Identifier
+	if packet.Code == eapRequest || packet.Code == eapResponse {
+		event.TypePresent = true
+		event.Type = packet.Type
+	}
+	if packet.Type == eapTypeIdentity {
+		event.IdentityLength = len(packet.Data)
+		digest := sha256.Sum256(packet.Data)
+		event.IdentitySHA256 = hex.EncodeToString(digest[:])
+		event.IdentityHasNUL = bytes.Contains(packet.Data, []byte{0})
+		redacted := append([]byte(nil), encoded...)
+		for index := 5; index < len(redacted); index++ {
+			redacted[index] = 0xaa
+		}
+		event.RawHexRedacted = hex.EncodeToString(redacted)
+		return event
+	}
+	if packet.Type != eapTypeAKA && packet.Type != eapTypeAKAPrime || len(packet.Data) < 3 {
+		return event
+	}
+	event.SubtypePresent = true
+	event.Subtype = packet.Data[0]
+	attributes, err := parseAKAAttributes(packet.Data[3:])
+	if err != nil {
+		event.ParseError = err.Error()
+		return event
+	}
+	redacted := append([]byte(nil), encoded...)
+	for _, attribute := range attributes {
+		if len(attribute.Raw) < 2 {
+			continue
+		}
+		trace := EAPTraceAttribute{
+			Type:        attribute.Type,
+			LengthUnits: attribute.Raw[1],
+			WireLength:  len(attribute.Raw),
+			ValueLength: len(attribute.Raw) - 2,
+		}
+		if attribute.Type == akaAttrIdentity && len(attribute.Raw) >= 4 {
+			identityLength := int(binary.BigEndian.Uint16(attribute.Raw[2:4]))
+			trace.IdentityLength = identityLength
+			if identityLength <= len(attribute.Raw)-4 {
+				identity := attribute.Raw[4 : 4+identityLength]
+				digest := sha256.Sum256(identity)
+				event.IdentityLength = identityLength
+				event.IdentitySHA256 = hex.EncodeToString(digest[:])
+				event.IdentityHasNUL = bytes.Contains(identity, []byte{0})
+				trace.IdentitySHA256 = event.IdentitySHA256
+				trace.IdentityHasNUL = event.IdentityHasNUL
+				trace.PaddingLength = len(attribute.Raw) - 4 - identityLength
+				padding := attribute.Raw[4+identityLength:]
+				for _, value := range padding {
+					if value != 0 {
+						trace.PaddingHasNonZero = true
+						break
+					}
+				}
+				attributeOffset := 5 + 3 + attribute.Offset
+				identityOffset := attributeOffset + 4
+				identityEnd := identityOffset + identityLength
+				if identityOffset >= 0 && identityEnd <= len(redacted) {
+					for index := identityOffset; index < identityEnd; index++ {
+						redacted[index] = 0xaa
+					}
+				}
+			}
+		}
+		event.Attributes = append(event.Attributes, trace)
+	}
+	event.RawHexRedacted = hex.EncodeToString(redacted)
+	return event
 }
 
 func oneAKAAttribute(attributes []akaAttribute, kind uint8) (akaAttribute, error) {

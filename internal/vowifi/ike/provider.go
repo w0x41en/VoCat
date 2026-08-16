@@ -39,6 +39,14 @@ type Config struct {
 	AllowSHA1 bool
 	// UseMODP1024 explicitly selects DH group 2 instead of the group 14 default.
 	UseMODP1024 bool
+	// EAPTrace receives redacted RX/TX EAP packets while a tunnel is being
+	// negotiated. It is optional and must not be used to log subscriber
+	// identity bytes directly.
+	EAPTrace EAPTraceCallback
+	// IKETrace receives the first IKE_AUTH payloads before encryption. IDi is
+	// redacted by the trace builder; the callback is intended for protocol
+	// diagnostics only.
+	IKETrace IKETraceCallback
 	// Resolve refreshes deployment configuration before each new tunnel.  The
 	// callback is intentionally evaluated only at session boundaries, so a
 	// live tunnel is never mutated underneath the IKE state machine.
@@ -139,6 +147,12 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		if resolved.Installer == nil {
 			resolved.Installer = provider.config.Installer
 		}
+		if resolved.EAPTrace == nil {
+			resolved.EAPTrace = provider.config.EAPTrace
+		}
+		if resolved.IKETrace == nil {
+			resolved.IKETrace = provider.config.IKETrace
+		}
 		resolved.Resolve = provider.config.Resolve
 		normalized, err := normalizeProviderConfig(resolved)
 		if err != nil {
@@ -182,7 +196,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	}()
 
 	group := uint16(dhMODP2048)
-	if provider.config.UseMODP1024 {
+	if provider.config.UseMODP1024 || request.Carrier.UseMODP1024 {
 		group = dhMODP1024
 	}
 	dh, err := newDHExchange(group, provider.config.Random)
@@ -243,15 +257,18 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	if err != nil {
 		return nil, err
 	}
-	if responseHeader.ResponderSPI == [8]byte{} {
-		return nil, errors.New("ike: responder returned a zero SPI")
-	}
 	initResponsePayloads, err := parsePayloadChain(responseHeader.NextPayload, responseBody)
 	if err != nil {
 		return nil, err
 	}
+	// A rejection is reported before the SPI check: an IKE_SA_INIT error
+	// notification legitimately carries a zero responder SPI, and its reason
+	// is what makes a carrier-specific proposal mismatch diagnosable.
 	if err := rejectFatalNotifications(initResponsePayloads); err != nil {
 		return nil, err
+	}
+	if responseHeader.ResponderSPI == [8]byte{} {
+		return nil, errors.New("ike: responder returned a zero SPI")
 	}
 	saPayload, err := onePayload(initResponsePayloads, payloadSA)
 	if err != nil {
@@ -343,6 +360,18 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	tsi := dualStackTrafficSelectors(payloadTSi)
 	tsr := dualStackTrafficSelectors(payloadTSr)
 	firstAuthPayloads := buildInitialEAPOnlyAuth(idi, requestedIDr, childOfferBody, tsi, tsr)
+	if provider.config.IKETrace != nil {
+		trace := traceIKEAuthPayloads("tx", 1, firstAuthPayloads)
+		identityAudit := traceAKAIdentityAudit(request.Identity, aka.identity, aka.method)
+		trace.ModemIMSIHash = identityAudit.ModemIMSIHash
+		trace.EAPIMSIHash = identityAudit.EAPIMSIHash
+		trace.ModemIMSILength = identityAudit.ModemIMSILength
+		trace.EAPIMSILength = identityAudit.EAPIMSILength
+		trace.SameIMSI = identityAudit.SameIMSI
+		trace.PermanentIdentityMatchesExpected = identityAudit.PermanentIdentityMatchesExpected
+		trace.ExpectedIdentityLength = identityAudit.ExpectedIdentityLength
+		provider.config.IKETrace(trace)
+	}
 	authHeader := ikeHeader{
 		InitiatorSPI: initiatorSPI,
 		ResponderSPI: responseHeader.ResponderSPI,
@@ -391,6 +420,9 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		if err != nil {
 			return nil, fmt.Errorf("ike: IKE_AUTH EAP round %d: %w", round+1, err)
 		}
+		if provider.config.EAPTrace != nil {
+			provider.config.EAPTrace(traceEAPPacket("rx", eapPayload.Body))
+		}
 		action, err := aka.handle(ctx, eapPayload.Body)
 		if err != nil {
 			return nil, err
@@ -407,6 +439,9 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 				)
 			}
 			return nil, errors.New("ike: EAP state machine produced no response")
+		}
+		if provider.config.EAPTrace != nil {
+			provider.config.EAPTrace(traceEAPPacket("tx", action.Response))
 		}
 		messageID++
 		eapRequest, err := encryptPayloads(ikeHeader{

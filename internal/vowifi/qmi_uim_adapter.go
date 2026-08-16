@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/qmiport"
 )

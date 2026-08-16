@@ -511,6 +511,63 @@ func TestEAPAKAIdentityRequiresExactlyOneRequestAttribute(t *testing.T) {
 	}
 }
 
+func TestEAPAKAIdentityWireEncodingHasExactLengthAndPadding(t *testing.T) {
+	client, err := newAKAClient(testSIMIdentity(), &testAKAProvider{})
+	if err != nil {
+		t.Fatalf("newAKAClient() error = %v", err)
+	}
+	permanent, _ := marshalAKAAttribute(akaAttrPermanentIDReq, []byte{0, 0})
+	request, _ := marshalEAPPacket(eapPacket{
+		Code:       eapRequest,
+		Identifier: 11,
+		Type:       eapTypeAKA,
+		Data:       append([]byte{akaSubtypeIdentity, 0, 0}, permanent...),
+	})
+	action, err := client.handle(context.Background(), request)
+	if err != nil {
+		t.Fatalf("identity response error = %v", err)
+	}
+	response, err := parseEAPPacket(action.Response)
+	if err != nil {
+		t.Fatalf("parse identity response = %v", err)
+	}
+	attributes, err := parseAKAAttributes(response.Data[3:])
+	if err != nil {
+		t.Fatalf("parse identity attributes = %v", err)
+	}
+	identity, err := oneAKAAttribute(attributes, akaAttrIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(identity.Raw) != ((4 + len(client.identity) + 3) &^ 3) {
+		t.Fatalf("wire attribute length = %d, want padded length for %d identity bytes", len(identity.Raw), len(client.identity))
+	}
+	actualLength := int(binary.BigEndian.Uint16(identity.Raw[2:4]))
+	if actualLength != len(client.identity) {
+		t.Fatalf("actual identity length = %d, want %d", actualLength, len(client.identity))
+	}
+	if !bytes.Equal(identity.Raw[4:4+actualLength], client.identity) {
+		t.Fatalf("identity bytes = %x, want %x", identity.Raw[4:4+actualLength], client.identity)
+	}
+	if bytes.Contains(identity.Raw[4:4+actualLength], []byte{0}) {
+		t.Fatal("identity bytes contain an unexpected NUL")
+	}
+	if !bytes.Equal(identity.Raw[4+actualLength:], make([]byte, len(identity.Raw)-4-actualLength)) {
+		t.Fatalf("identity padding is not all zero: %x", identity.Raw[4+actualLength:])
+	}
+	trace := traceEAPPacket("tx", action.Response)
+	if trace.ParseError != "" || !trace.TypePresent || !trace.SubtypePresent || trace.Subtype != akaSubtypeIdentity {
+		t.Fatalf("identity trace = %#v", trace)
+	}
+	if len(trace.Attributes) != 1 || trace.Attributes[0].IdentityLength != len(client.identity) ||
+		trace.Attributes[0].IdentityHasNUL || trace.Attributes[0].PaddingHasNonZero {
+		t.Fatalf("identity trace attributes = %#v", trace.Attributes)
+	}
+	if trace.RawHexRedacted == hex.EncodeToString(action.Response) {
+		t.Fatal("identity trace did not redact subscriber identity bytes")
+	}
+}
+
 func TestEAPFailureIsAcceptedOnlyAfterAMethodFailureResponse(t *testing.T) {
 	client, err := newAKAClient(testSIMIdentity(), &testAKAProvider{})
 	if err != nil {
