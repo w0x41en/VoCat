@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // EsimNotification is one notification retained by an eUICC until its receiver
@@ -290,6 +291,79 @@ func (channel *euiccChannel) deliverPendingNotifications(ctx context.Context) er
 		}
 	}
 	return errors.Join(failures...)
+}
+
+// deliverNotificationsAfter acknowledges only notifications created after a
+// pre-operation watermark. This mirrors OpenEUICC's beginTrackedOperation:
+// notifications that were already pending before a profile switch must not be
+// replayed or allowed to overtake a newer notification for the same receiver.
+func (channel *euiccChannel) deliverNotificationsAfter(ctx context.Context, minimumSequence uint64) error {
+	notifications, err := channel.listNotifications(ctx)
+	if err != nil {
+		return err
+	}
+	blockedAddresses := make(map[string]bool)
+	var failures []error
+	for _, notification := range notifications {
+		if notification.SequenceNumber <= minimumSequence || blockedAddresses[notification.Address] {
+			continue
+		}
+		pending, retrieveErr := channel.retrieveNotifications(ctx, &notification.SequenceNumber)
+		if retrieveErr == nil {
+			retrieveErr = fmt.Errorf("esim: notification %d was not returned by eUICC", notification.SequenceNumber)
+			for _, candidate := range pending {
+				if candidate.SequenceNumber == notification.SequenceNumber {
+					retrieveErr = channel.deliverNotification(ctx, candidate)
+					break
+				}
+			}
+		}
+		if retrieveErr != nil {
+			blockedAddresses[notification.Address] = true
+			failures = append(failures, fmt.Errorf("notification %d to %s: %w", notification.SequenceNumber, notification.Address, retrieveErr))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// esimNotificationWatermark records the highest retained notification before
+// a mutating profile operation. It is deliberately best-effort: notification
+// delivery is auxiliary to the profile commit and an eUICC that does not
+// expose the notification service must not make a valid switch fail.
+func (manager *Manager) esimNotificationWatermark(ctx context.Context, id, aidHex string) (uint64, bool, error) {
+	operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	channel, err := manager.openEuiccAID(operationContext, id, targetEuiccAID(aidHex))
+	if err != nil {
+		return 0, false, err
+	}
+	defer channel.close(context.Background())
+	notifications, err := channel.listNotifications(operationContext)
+	if err != nil {
+		return 0, false, err
+	}
+	var watermark uint64
+	for _, notification := range notifications {
+		if notification.SequenceNumber > watermark {
+			watermark = notification.SequenceNumber
+		}
+	}
+	return watermark, true, nil
+}
+
+// deliverNewESIMNotifications is called only after the target profile has
+// been verified through the modem. A delivery failure is returned to the
+// caller for logging, but callers intentionally keep the profile switch
+// successful; the eUICC retains the notification for a later retry.
+func (manager *Manager) deliverNewESIMNotifications(ctx context.Context, id, aidHex string, watermark uint64) error {
+	operationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	channel, err := manager.openEuiccAID(operationContext, id, targetEuiccAID(aidHex))
+	if err != nil {
+		return err
+	}
+	defer channel.close(context.Background())
+	return channel.deliverNotificationsAfter(operationContext, watermark)
 }
 
 // ESIMNotifications returns the notifications retained across every eUICC

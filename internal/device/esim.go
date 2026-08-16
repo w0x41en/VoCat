@@ -246,12 +246,25 @@ func encodeICCID(digits string) ([]byte, error) {
 }
 
 func buildEnableProfileRequest(iccid string) ([]byte, error) {
+	return buildEnableProfileRequestWithRefresh(iccid, true)
+}
+
+// buildEnableProfileRequestWithRefresh mirrors lpac/OpenEUICC's refresh flag:
+// 0xFF asks the eUICC to trigger the terminal refresh, while 0x80 explicitly
+// requests the same profile operation without that refresh. The latter is a
+// compatibility fallback when the first request was interrupted while the
+// modem was consuming the proactive refresh.
+func buildEnableProfileRequestWithRefresh(iccid string, refresh bool) ([]byte, error) {
 	bcd, err := encodeICCID(iccid)
 	if err != nil {
 		return nil, err
 	}
 	profileID := derConstruct(0xA0, derEncode(0x5A, bcd))
-	return derConstruct(0xBF31, profileID, derEncode(0x81, []byte{0xFF})), nil
+	refreshValue := byte(0x80)
+	if refresh {
+		refreshValue = 0xFF
+	}
+	return derConstruct(0xBF31, profileID, derEncode(0x81, []byte{refreshValue})), nil
 }
 
 // parseCSIM extracts the payload and status word from an AT+CSIM response.
@@ -804,16 +817,52 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 		report("done", "Profile 切换完成", 100)
 		return nil
 	}
+	notificationWatermark, notificationWatermarkKnown, notificationWatermarkErr :=
+		manager.esimNotificationWatermark(ctx, id, aidHex)
+	if notificationWatermarkErr != nil {
+		manager.logEvent(slog.LevelDebug, "SIM profile switch notification watermark unavailable",
+			"category", "sim_switch", "event", "profile_switch_notification_watermark_unavailable",
+			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", notificationWatermarkErr)
+	}
 
-	attempt, switchErr := manager.sendEnableProfile(ctx, id, iccid, aidHex)
+	attempt, switchErr := manager.sendEnableProfile(ctx, id, iccid, aidHex, true)
 	if !attempt.attempted {
 		return switchErr
 	}
-	if switchErr != nil {
+	// Match OpenEUICC/lpac's compatibility behavior: a card-side result code
+	// is a definitive rejection and must not reset the modem.  Only an exchange
+	// that never yielded a valid result is retried without the proactive refresh
+	// flag; the live ICCID verification below remains authoritative because the
+	// first request may already have committed before its transport failed.
+	if attempt.rejected {
+		manager.logEvent(slog.LevelWarn, "SIM profile switch rejected by eUICC",
+			"category", "sim_switch", "event", "profile_switch_rejected",
+			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", switchErr)
+		return switchErr
+	}
+	if switchErr != nil && !attempt.committed {
+		report("refresh_fallback", "刷新通知通道中断，正在按兼容模式重试…", 3)
+		fallbackAttempt, fallbackErr := manager.sendEnableProfile(ctx, id, iccid, aidHex, false)
+		if fallbackAttempt.committed {
+			attempt = fallbackAttempt
+			// A close error after a valid result is not a reason to discard the
+			// commit; recovery below will close/reopen the modem-side channel.
+			switchErr = fallbackErr
+			manager.logEvent(slog.LevelWarn, "SIM profile switch accepted without refresh",
+				"category", "sim_switch", "event", "profile_switch_refresh_fallback_accepted",
+				"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", fallbackErr)
+		} else {
+			switchErr = errors.Join(switchErr, fallbackErr)
+			manager.logEvent(slog.LevelWarn, "SIM profile switch APDU outcome is uncertain",
+				"category", "sim_switch", "event", "profile_switch_apdu_uncertain",
+				"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", switchErr)
+		}
+	}
+	if switchErr != nil && !attempt.committed {
 		manager.logEvent(slog.LevelWarn, "SIM profile switch APDU outcome is uncertain",
 			"category", "sim_switch", "event", "profile_switch_apdu_uncertain",
 			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", switchErr)
-	} else {
+	} else if attempt.committed {
 		manager.logEvent(slog.LevelInfo, "SIM profile accepted by eUICC; modem recovery queued",
 			"category", "sim_switch", "event", "profile_switch_accepted",
 			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "result_code", 0,
@@ -860,6 +909,21 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 				"device_id", id, "target_iccid_last4", redactSubscriberID(iccid), "error", err)
 			return err
 		}
+		if notificationWatermarkKnown {
+			notificationContext, cancelNotifications := context.WithTimeout(
+				context.WithoutCancel(verifyContext), 2*time.Minute,
+			)
+			notificationErr := manager.deliverNewESIMNotifications(
+				notificationContext, id, aidHex, notificationWatermark,
+			)
+			cancelNotifications()
+			if notificationErr != nil {
+				manager.logEvent(slog.LevelWarn, "SIM profile switch notification delivery deferred",
+					"category", "sim_switch", "event", "profile_switch_notification_delivery_deferred",
+					"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
+					"error", notificationErr)
+			}
+		}
 		manager.logEvent(slog.LevelInfo, "SIM profile switch completed",
 			"category", "sim_switch", "event", "profile_switch_completed",
 			"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
@@ -886,22 +950,41 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 	return manager.rollbackFailedProfileSwitch(id, iccid, aidHex, previousICCID, previousKnown, failure)
 }
 
-// enableProfileAttempt records whether an EnableProfile APDU was actually
-// sent.  An error before the APDU (for example, no logical channel) is safe to
-// return directly; after the APDU starts, the card may already have committed
-// even when the transport reports an error.
+// enableProfileAttempt classifies the outcome of one EnableProfile exchange.
+// A valid non-zero eUICC result is a known rejection and must not trigger a
+// modem reset.  A transport/malformed-response error leaves the commit
+// uncertain, so the caller follows OpenEUICC's refresh=false compatibility
+// path and then verifies the live profile before deciding whether to rollback.
 type enableProfileAttempt struct {
-	attempted bool
+	attempted        bool
+	responseReceived bool
+	committed        bool
+	rejected         bool
+}
+
+func classifyEnableProfileResponse(payload []byte) (enableProfileAttempt, error) {
+	attempt := enableProfileAttempt{attempted: true}
+	result, ok := enableProfileResult(payload)
+	if !ok {
+		return attempt, fmt.Errorf("esim: unexpected EnableProfile response %s", strings.ToUpper(hex.EncodeToString(payload)))
+	}
+	attempt.responseReceived = true
+	if resultErr := enableProfileResponseError(byte(result), payload); resultErr != nil {
+		attempt.rejected = true
+		return attempt, resultErr
+	}
+	attempt.committed = true
+	return attempt, nil
 }
 
 // sendEnableProfile performs exactly one ES10c EnableProfile transaction. It
 // intentionally has no cache or recovery side effects so it can be reused for
 // the compensating rollback profile without recursively taking esimMu.
-func (manager *Manager) sendEnableProfile(ctx context.Context, id, iccid, aidHex string) (enableProfileAttempt, error) {
+func (manager *Manager) sendEnableProfile(ctx context.Context, id, iccid, aidHex string, refresh bool) (enableProfileAttempt, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	request, err := buildEnableProfileRequest(strings.TrimSpace(iccid))
+	request, err := buildEnableProfileRequestWithRefresh(strings.TrimSpace(iccid), refresh)
 	if err != nil {
 		return enableProfileAttempt{}, err
 	}
@@ -913,21 +996,27 @@ func (manager *Manager) sendEnableProfile(ctx context.Context, id, iccid, aidHex
 	commitContext, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), csimAPDUTimeout)
 	payload, sendErr := channel.es10(commitContext, request)
 	cancelCommit()
+	if sendErr != nil {
+		closeContext, cancelClose := context.WithTimeout(context.Background(), csimAPDUTimeout)
+		closeErr := channel.backend.close(closeContext)
+		cancelClose()
+		return attempt, errors.Join(sendErr, closeErr)
+	}
+	classified, classifyErr := classifyEnableProfileResponse(payload)
+	attempt.responseReceived = classified.responseReceived
+	attempt.committed = classified.committed
+	attempt.rejected = classified.rejected
+	if classifyErr != nil {
+		closeContext, cancelClose := context.WithTimeout(context.Background(), csimAPDUTimeout)
+		closeErr := channel.backend.close(closeContext)
+		cancelClose()
+		return attempt, errors.Join(classifyErr, closeErr)
+	}
 	closeContext, cancelClose := context.WithTimeout(context.Background(), csimAPDUTimeout)
 	closeErr := channel.backend.close(closeContext)
 	cancelClose()
-	if sendErr != nil {
-		return attempt, errors.Join(sendErr, closeErr)
-	}
 	if closeErr != nil {
 		return attempt, fmt.Errorf("esim: close EnableProfile channel: %w", closeErr)
-	}
-	result, ok := enableProfileResult(payload)
-	if !ok {
-		return attempt, fmt.Errorf("esim: unexpected EnableProfile response %s", strings.ToUpper(hex.EncodeToString(payload)))
-	}
-	if err := enableProfileResponseError(byte(result), payload); err != nil {
-		return attempt, err
 	}
 	return attempt, nil
 }
@@ -1033,7 +1122,7 @@ func (manager *Manager) rollbackFailedProfileSwitch(
 		"category", "sim_switch", "event", "profile_switch_rollback_started",
 		"device_id", id, "target_iccid_last4", redactSubscriberID(targetICCID),
 		"previous_iccid_last4", redactSubscriberID(previousICCID))
-	attempt, rollbackErr := manager.sendEnableProfile(rollbackContext, id, previousICCID, aidHex)
+	attempt, rollbackErr := manager.sendEnableProfile(rollbackContext, id, previousICCID, aidHex, true)
 	if attempt.attempted {
 		manager.markQMIWMSContextPending(id)
 		manager.startProfileSwitchRecovery(id, previousICCID)
@@ -1330,10 +1419,17 @@ func (manager *Manager) recoverAfterProfileSwitch(id, target string) {
 				"elapsed_ms", time.Since(recoveryStartedAt).Milliseconds(),
 				"error", errString(identityErr))
 			if identityErr == nil && validProfileICCID(live) {
+				if strings.TrimSpace(target) == "" {
+					// DisableProfile has no active ICCID to publish. The live
+					// identity may still be the pre-refresh card, so never merge it
+					// into the overview as if it were an enabled profile.
+					manager.refreshAfterProfileSwitch(id)
+					return
+				}
 				// A native read can still be the old card for a short period after
 				// reset. Never publish it into the overview while a switch has a
 				// concrete target; verification owns the final commit.
-				if strings.TrimSpace(target) == "" || strings.EqualFold(live, target) {
+				if strings.EqualFold(live, target) {
 					manager.mergeVerifiedProfileSnapshot(id, live)
 					manager.finishRecovery(id)
 				}

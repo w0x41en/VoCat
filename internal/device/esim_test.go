@@ -122,6 +122,13 @@ func TestEnableProfileRequestPads18DigitICCIDToTenOctets(t *testing.T) {
 	if got := strings.ToUpper(hex.EncodeToString(request)); got != "BF3111A00C5A0A989412006780155932FF8101FF" {
 		t.Fatalf("EnableProfile request = %s", got)
 	}
+	fallback, err := buildEnableProfileRequestWithRefresh("894921007608519523", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.ToUpper(hex.EncodeToString(fallback)); got != "BF3111A00C5A0A989412006780155932FF810180" {
+		t.Fatalf("EnableProfile refresh=false request = %s", got)
+	}
 }
 
 func TestDeleteProfileRequestAndResult(t *testing.T) {
@@ -189,6 +196,18 @@ func TestEnableProfileResultErrors(t *testing.T) {
 	policyResponse := []byte{0xBF, 0x31, 0x03, 0x80, 0x01, 0x03}
 	if err := enableProfileResponseError(3, policyResponse); !errors.Is(err, ErrESIMEnableDisallowedPolicy) {
 		t.Fatalf("EnableProfile policy error = %v", err)
+	}
+	rejected, err := classifyEnableProfileResponse(policyResponse)
+	if err == nil || !rejected.responseReceived || !rejected.rejected || rejected.committed {
+		t.Fatalf("card rejection classification = %#v, %v", rejected, err)
+	}
+	accepted, err := classifyEnableProfileResponse([]byte{0xBF, 0x31, 0x03, 0x80, 0x01, 0x00})
+	if err != nil || !accepted.responseReceived || !accepted.committed || accepted.rejected {
+		t.Fatalf("card success classification = %#v, %v", accepted, err)
+	}
+	unknown, err := classifyEnableProfileResponse([]byte{0xBF, 0x31, 0x01, 0x00})
+	if err == nil || unknown.responseReceived || unknown.committed || unknown.rejected {
+		t.Fatalf("malformed response classification = %#v, %v", unknown, err)
 	}
 }
 
