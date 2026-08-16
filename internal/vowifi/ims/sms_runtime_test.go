@@ -702,6 +702,115 @@ func TestEncodeRPAddressRejectsCharactersInsteadOfCleaningThem(t *testing.T) {
 	}
 }
 
+func TestDecodeRPAddressRoundTrips(t *testing.T) {
+	for _, number := range []string{"+639171234567", "+447700900123", "+8613800138000"} {
+		encoded, err := encodeRPAddress(number)
+		if err != nil {
+			t.Fatalf("encodeRPAddress(%q): %v", number, err)
+		}
+		if got := decodeRPAddress(encoded); got != number {
+			t.Fatalf("decodeRPAddress(encode(%q)) = %q", number, got)
+		}
+	}
+}
+
+func TestDecodeRPAddressRejectsNonDigitNibble(t *testing.T) {
+	// A BCD nibble in 0x0A..0x0E is not a digit; the decoder must not turn it
+	// into ':' and instead reject the address. 0xA0 = low 0x00, high 0x0A.
+	if got := decodeRPAddress([]byte{0x91, 0xA0}); got != "" {
+		t.Fatalf("decodeRPAddress with 0xA nibble = %q, want empty", got)
+	}
+	if got := decodeRPAddress([]byte{0x91, 0x13}); got != "+31" {
+		t.Fatalf("decodeRPAddress valid = %q, want +31", got)
+	}
+}
+
+func TestNormalizeE164AddsInternationalPrefix(t *testing.T) {
+	if got := normalizeE164("639934444415"); got != "+639934444415" {
+		t.Fatalf("normalizeE164 national = %q", got)
+	}
+	if got := normalizeE164("+639934444415"); got != "+639934444415" {
+		t.Fatalf("normalizeE164 international = %q", got)
+	}
+	if got := normalizeE164("   "); got != "" {
+		t.Fatalf("normalizeE164 blank = %q", got)
+	}
+}
+
+func TestSelectPublicIdentityPrefersTelThenPlusSIP(t *testing.T) {
+	associated := []string{
+		"sip:515661000061889@ims.mnc066.mcc515.3gppnetwork.org", // temporary IMPU, no +
+		"sip:+639171234567@ims.mnc066.mcc515.3gppnetwork.org",   // +user
+		"tel:+639171234567",
+	}
+	if got := selectPublicIdentity(associated); got != "tel:+639171234567" {
+		t.Fatalf("selectPublicIdentity = %q, want tel:+", got)
+	}
+	if got := selectPublicIdentity(associated[:2]); got != "sip:+639171234567@ims.mnc066.mcc515.3gppnetwork.org" {
+		t.Fatalf("selectPublicIdentity without tel = %q", got)
+	}
+	if got := selectPublicIdentity(associated[:1]); got != "" {
+		t.Fatalf("selectPublicIdentity bare IMPU = %q, want empty", got)
+	}
+}
+
+func TestPublicIdentityForRequestFallsBackToTemporaryIMPU(t *testing.T) {
+	session := &Session{
+		identity: identitySet{public: "sip:515661000061889@ims.mnc066.mcc515.3gppnetwork.org"},
+	}
+	if got := session.publicIdentityForRequest(); got != "sip:515661000061889@ims.mnc066.mcc515.3gppnetwork.org" {
+		t.Fatalf("fallback public identity = %q", got)
+	}
+	session.evidence.PAssociatedURI = []string{"tel:+639171234567"}
+	if got := session.publicIdentityForRequest(); got != "tel:+639171234567" {
+		t.Fatalf("associated public identity = %q", got)
+	}
+}
+
+func TestDeliveryReportTargetPrefersRPOriginatingAddress(t *testing.T) {
+	session := &Session{
+		request:  vowifi.IMSRequest{Identity: vowifi.SIMIdentity{IMSI: "515661000061889", SMSC: "+639171234567"}},
+		provider: &Provider{config: Config{SMSCenter: "+447700900123"}},
+	}
+	// A bare hostname PAI is exactly the shape that drew 403 "Invalid User".
+	hostOnly := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+		"p-asserted-identity": {"sip:CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org"},
+		"from":                {"<sip:ipsmgw@example.test>;tag=gw"},
+	}}
+
+	if got := session.deliveryReportTarget(hostOnly, "+639171234567"); got != "tel:+639171234567" {
+		t.Fatalf("RP-OA target = %q", got)
+	}
+	if got := session.deliveryReportTarget(hostOnly, ""); got != "tel:+639171234567" {
+		t.Fatalf("configured SMSC target = %q", got)
+	}
+
+	// The configured service centre only wins when the identity carries no SMSC.
+	noIdentitySMSC := &Session{
+		request:  vowifi.IMSRequest{Identity: vowifi.SIMIdentity{IMSI: "515661000061889"}},
+		provider: &Provider{config: Config{SMSCenter: "+447700900123"}},
+	}
+	if got := noIdentitySMSC.deliveryReportTarget(hostOnly, ""); got != "tel:+447700900123" {
+		t.Fatalf("SMSCenter fallback target = %q", got)
+	}
+
+	// A user-carrying PAI is routable and wins over the configured SMSC.
+	withUser := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+		"p-asserted-identity": {"<sip:user@example.test>"},
+	}}
+	if got := session.deliveryReportTarget(withUser, ""); got != "sip:user@example.test" {
+		t.Fatalf("PAI user target = %q", got)
+	}
+
+	// A tel: PAI is also routable.
+	telPAI := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+		"p-asserted-identity": {"<tel:+639171234567>"},
+	}}
+	if got := session.deliveryReportTarget(telPAI, ""); got != "tel:+639171234567" {
+		t.Fatalf("tel: PAI target = %q", got)
+	}
+}
+
 func TestRegistrationExpiryUsesMatchedContact(t *testing.T) {
 	response := &sipResponse{Headers: map[string][]string{
 		"contact": {
@@ -1077,7 +1186,7 @@ func TestInboundSMSDeliveryReportOutcomeIsReported(t *testing.T) {
 		request := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
 			"call-id": {"deliver-unaddressable"},
 		}}
-		session.sendDeliveryReport(request, []byte{0x02, 0x2a})
+		session.sendDeliveryReport(request, []byte{0x02, 0x2a}, "")
 		select {
 		case outcome := <-reports:
 			if outcome.Target != "" || outcome.Error == "" || outcome.StatusCode != 0 {

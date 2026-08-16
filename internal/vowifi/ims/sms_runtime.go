@@ -546,7 +546,7 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 			if errors.Is(err, errRPMessageType) {
 				cause = 97
 			}
-			session.sendDeliveryReport(request, buildRPError(rpdu.reference, cause))
+			session.sendDeliveryReport(request, buildRPError(rpdu.reference, cause), rpdu.originating)
 		}
 		return
 	}
@@ -554,19 +554,19 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 		// The even MTI values are defined only in the MS-to-network direction.
 		// Received from the network they are reserved and require cause 97, just
 		// like the direction-independent reserved values rejected by parseRPDU.
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 97))
+		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 97), rpdu.originating)
 		return
 	}
 	message, err := device.DecodeSMSDeliverTPDU(rpdu.tpdu)
 	if err != nil {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95), rpdu.originating)
 		return
 	}
 	receivedAt := time.Now().UTC()
 	callID := strings.TrimSpace(request.value("Call-ID"))
 	if message.Direction == device.SMSDirectionStatusReport {
 		if message.MessageReference == nil || message.StatusCode == nil {
-			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95), rpdu.originating)
 			return
 		}
 		status := ReceivedSMSStatus{
@@ -590,14 +590,14 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 			cancel()
 		}
 		if err != nil {
-			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22))
+			session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22), rpdu.originating)
 			return
 		}
-		session.sendDeliveryReport(request, []byte{0x02, rpdu.reference})
+		session.sendDeliveryReport(request, []byte{0x02, rpdu.reference}, rpdu.originating)
 		return
 	}
 	if message.Direction != device.SMSDirectionReceived {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95))
+		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 95), rpdu.originating)
 		return
 	}
 	var serviceCenterTimestamp *time.Time
@@ -629,13 +629,13 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 		cancel()
 	}
 	if err != nil {
-		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22))
+		session.sendDeliveryReport(request, buildRPError(rpdu.reference, 22), rpdu.originating)
 		return
 	}
-	session.sendDeliveryReport(request, []byte{0x02, rpdu.reference})
+	session.sendDeliveryReport(request, []byte{0x02, rpdu.reference}, rpdu.originating)
 }
 
-func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) {
+func (session *Session) sendDeliveryReport(request *sipRequest, report []byte, originating string) {
 	outcome := SMSDeliveryReport{
 		DeviceID: session.request.DeviceID,
 		CallID:   strings.TrimSpace(request.value("Call-ID")),
@@ -647,10 +647,7 @@ func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) {
 			outcome.Kind = "error"
 		}
 	}
-	target := firstURI(request.value("P-Asserted-Identity"))
-	if target == "" {
-		target = firstURI(request.value("From"))
-	}
+	target := session.deliveryReportTarget(request, originating)
 	outcome.Target = target
 	if target == "" {
 		outcome.Error = "inbound message carried no address to acknowledge"
@@ -668,6 +665,8 @@ func (session *Session) sendDeliveryReport(request *sipRequest, report []byte) {
 	}
 	if response != nil {
 		outcome.StatusCode = response.StatusCode
+		outcome.ReasonPhrase = strings.TrimSpace(response.Reason)
+		outcome.Warning = strings.TrimSpace(response.value("Warning"))
 	}
 	session.reportSMSDelivery(outcome)
 }
@@ -901,6 +900,7 @@ func (session *Session) buildSIPMessage(
 		session.securityAgreement.verifyValue,
 	)
 	session.mu.Unlock()
+	public := session.publicIdentityForRequest()
 	transportUpper := strings.ToUpper(session.transport)
 	lines := []string{
 		"MESSAGE " + target + " SIP/2.0",
@@ -916,11 +916,11 @@ func (session *Session) buildSIPMessage(
 		}
 	}
 	lines = append(lines,
-		"From: <"+session.identity.public+">;tag="+session.fromTag,
+		"From: <"+public+">;tag="+session.fromTag,
 		"To: <"+target+">",
 		"Call-ID: "+callID,
 		fmt.Sprintf("CSeq: %d MESSAGE", cseq),
-		"P-Preferred-Identity: <"+session.identity.public+">",
+		"P-Preferred-Identity: <"+public+">",
 		"Accept-Contact: *;+g.3gpp.smsip",
 	)
 	if inReplyTo != "" {
@@ -955,6 +955,10 @@ type rpMessage struct {
 	messageType byte
 	reference   byte
 	cause       byte
+	// originating holds the decoded RP-Originating Address of an inbound
+	// RP-DATA (the service centre). It is empty unless the address parsed to a
+	// usable E.164 number, and is only populated for network-to-MS RP-DATA.
+	originating string
 	tpdu        []byte
 }
 
@@ -977,6 +981,12 @@ func parseRPDU(data []byte) (rpMessage, error) {
 			index++
 			if length > len(data)-index {
 				return result, errors.New("ims: RP-DATA address length is invalid")
+			}
+			// The first address of a network-to-MS RP-DATA is the RP-OA (service
+			// centre). A delivery report must route back to it, so decode it
+			// rather than skipping over it as the old parser did.
+			if count == 0 && result.messageType == 1 {
+				result.originating = decodeRPAddress(data[index : index+length])
 			}
 			index += length
 		}
@@ -1079,8 +1089,102 @@ func encodeRPAddress(value string) ([]byte, error) {
 	return append([]byte{toa}, encoded...), nil
 }
 
+// decodeRPAddress decodes an RP address field — a type-of-address octet followed
+// by semi-octet BCD digits — back into an E.164 string. International numbers
+// keep the "+" prefix so the result can be fed straight back into a tel: URI or
+// encodeRPAddress. It is deliberately lenient: anything unparseable yields "".
+func decodeRPAddress(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	toa := data[0]
+	digits := make([]byte, 0, (len(data)-1)*2)
+	for _, octet := range data[1:] {
+		low := octet & 0x0f
+		if low == 0x0f {
+			break
+		}
+		if low > 0x09 {
+			return ""
+		}
+		digits = append(digits, '0'+low)
+		high := octet >> 4
+		if high == 0x0f {
+			break
+		}
+		if high > 0x09 {
+			return ""
+		}
+		digits = append(digits, '0'+high)
+	}
+	if len(digits) == 0 {
+		return ""
+	}
+	// 0x70 selects the type-of-number field; 001 = international.
+	if toa&0x70 == 0x10 {
+		return "+" + string(digits)
+	}
+	return string(digits)
+}
+
+// normalizeE164 canonicalizes a service-centre number for a tel: URI. E.164 is
+// always international, so a bare digit string gets a leading "+" added while an
+// existing "+" is preserved. It only trims and does not otherwise validate, so
+// callers still enforce digit/length rules (see encodeRPAddress).
 func normalizeE164(value string) string {
-	return strings.TrimSpace(value)
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !strings.HasPrefix(value, "+") {
+		return "+" + value
+	}
+	return value
+}
+
+// deliveryReportTarget chooses where to route an SMS delivery report. The
+// Request-URI of the outbound MESSAGE is what the S-CSCF routes on, so it must
+// name a real user; a bare hostname (e.g. an IP-SM-GW asserted identity with no
+// user part) is not resolvable by the home I-CSCF and draws 403 "Invalid User".
+func (session *Session) deliveryReportTarget(request *sipRequest, originating string) string {
+	// 1. The RP-OA of the inbound RP-DATA is the service centre; routing to it
+	//    mirrors the mobile-originated path (tel:+<SMSC>).
+	if smsc := normalizeE164(originating); smsc != "" {
+		return "tel:" + smsc
+	}
+	// 2. P-Asserted-Identity, but only when it names a user.
+	if target := firstURI(request.value("P-Asserted-Identity")); usableDeliveryTarget(target) {
+		return target
+	}
+	// 3. The configured service centre, in the same form as MO submission.
+	if smsc := normalizeE164(session.request.Identity.SMSC); smsc != "" {
+		return "tel:" + smsc
+	}
+	if smsc := normalizeE164(session.provider.config.SMSCenter); smsc != "" {
+		return "tel:" + smsc
+	}
+	// 4. Last resort: the asserted From identity.
+	return firstURI(request.value("From"))
+}
+
+// usableDeliveryTarget reports whether a SIP Request-URI names a routable user:
+// a tel: URI with a number, or a sip:/sips: URI carrying a user part. A
+// host-only or empty URI cannot be resolved by the home I-CSCF.
+func usableDeliveryTarget(target string) bool {
+	target = strings.TrimSpace(target)
+	lower := strings.ToLower(target)
+	if strings.HasPrefix(lower, "tel:") {
+		return strings.TrimSpace(target[4:]) != ""
+	}
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") {
+		return false
+	}
+	rest := target[strings.IndexByte(target, ':')+1:]
+	if separator := strings.IndexAny(rest, ";?"); separator >= 0 {
+		rest = rest[:separator]
+	}
+	at := strings.IndexByte(rest, '@')
+	return at > 0 && strings.TrimSpace(rest[:at]) != ""
 }
 
 func firstURI(value string) string {
@@ -1094,6 +1198,64 @@ func firstURI(value string) string {
 		value = value[:semicolon]
 	}
 	return strings.TrimSpace(value)
+}
+
+// publicIdentityForRequest returns the identity to assert in From and
+// P-Preferred-Identity of a non-REGISTER request (MESSAGE, INVITE). TS 24.229
+// §5.1.2A.1 requires these to come from the P-Associated-URI of the REGISTER 200
+// OK, not the temporary IMSI-derived IMPU, which is only legal in REGISTER
+// itself. A tel: URI wins; otherwise a sip:/sips: URI whose user part begins with
+// '+' (an E.164 MSISDN, not an IMSI). When the registrar associated no usable
+// identity, it falls back to the temporary IMPU — the behavior being replaced.
+func (session *Session) publicIdentityForRequest() string {
+	session.mu.Lock()
+	associated := append([]string(nil), session.evidence.PAssociatedURI...)
+	session.mu.Unlock()
+	if selected := selectPublicIdentity(associated); selected != "" {
+		return selected
+	}
+	return session.identity.public
+}
+
+// selectPublicIdentity picks the first usable P-Associated-URI: tel: always wins,
+// then a sip:/sips: URI with a leading '+' user part. It returns "" when none
+// qualifies, which lets the caller fall back to the temporary IMPU.
+func selectPublicIdentity(associated []string) string {
+	var sipFallback string
+	for _, raw := range associated {
+		uri := firstURI(raw)
+		if uri == "" {
+			continue
+		}
+		lower := strings.ToLower(uri)
+		if strings.HasPrefix(lower, "tel:") {
+			return uri
+		}
+		if sipFallback == "" && (strings.HasPrefix(lower, "sip:") || strings.HasPrefix(lower, "sips:")) {
+			if plusUserPart(uri) {
+				sipFallback = uri
+			}
+		}
+	}
+	return sipFallback
+}
+
+// plusUserPart reports whether a sip:/sips: URI carries an E.164 user part, i.e.
+// the part before '@' begins with '+'. A bare IMSI-derived IMPU has no '+'.
+func plusUserPart(uri string) bool {
+	colon := strings.IndexByte(uri, ':')
+	if colon < 0 {
+		return false
+	}
+	rest := uri[colon+1:]
+	if separator := strings.IndexAny(rest, ";?"); separator >= 0 {
+		rest = rest[:separator]
+	}
+	at := strings.IndexByte(rest, '@')
+	if at <= 0 {
+		return false
+	}
+	return strings.HasPrefix(rest[:at], "+")
 }
 
 func (session *Session) isClosed() bool {

@@ -73,6 +73,13 @@ type Config struct {
 	// the same SMS six times. It is diagnostic only: the report is best-effort
 	// either way, and the callback must not block.
 	OnSMSDeliveryReport func(context.Context, SMSDeliveryReport)
+	// OnRegistered observes the identities the registrar associated with a
+	// successful (or refreshed) registration, i.e. the P-Associated-URI of the
+	// REGISTER 200 OK. Non-REGISTER requests must be asserted with one of these
+	// rather than the temporary IMSI-derived IMPU, so this is the field to read
+	// when diagnosing a 403 "Invalid User" on MESSAGE/INVITE. Diagnostic only:
+	// the callback must not block and must not retain the evidence.
+	OnRegistered func(context.Context, vowifi.IMSEvidence)
 }
 
 // SMSDeliveryReport records how the acknowledgement for one inbound SMS fared.
@@ -88,7 +95,14 @@ type SMSDeliveryReport struct {
 	// StatusCode is the SIP status of the report transaction, or 0 when no
 	// response arrived.
 	StatusCode int
-	Error      string
+	// ReasonPhrase is the SIP reason phrase of the report response, e.g.
+	// "Forbidden" for a 403. It is empty when no response arrived.
+	ReasonPhrase string
+	// Warning is the SIP Warning header of the report response, which carriers
+	// use to explain a rejection (for example why an IP-SM-GW refuses an
+	// RP-ACK). Empty when absent.
+	Warning string
+	Error   string
 }
 
 // Provider implements vowifi.IMSProvider using a small RFC 3261 REGISTER
@@ -1109,6 +1123,9 @@ func (session *Session) applyRegistrationEvidence(response *sipResponse) error {
 		SecurityVerified:     session.securityActive,
 	}
 	session.clearAuthentication()
+	if session.provider.config.OnRegistered != nil {
+		session.provider.config.OnRegistered(context.Background(), cloneEvidence(session.evidence))
+	}
 	return nil
 }
 

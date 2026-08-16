@@ -1064,6 +1064,7 @@ func newVoWiFiOrchestrator(
 				"device_id", outcome.DeviceID, "kind", outcome.Kind,
 				"call_id", outcome.CallID, "rp_reference", outcome.RPReference,
 				"target", outcome.Target, "sip_status", outcome.StatusCode,
+				"sip_reason", outcome.ReasonPhrase, "sip_warning", outcome.Warning,
 			}
 			if outcome.Error != "" {
 				attributes = append(attributes, "error", outcome.Error)
@@ -1075,6 +1076,21 @@ func newVoWiFiOrchestrator(
 				return
 			}
 			logger.Info("IMS SMS delivery report accepted", attributes...)
+		},
+		OnRegistered: func(_ context.Context, evidence vowifi.IMSEvidence) {
+			// Non-REGISTER requests must be asserted with a P-Associated-URI, so
+			// this is the diagnostic that shows whether the carrier actually
+			// returned an MSISDN to use. When it only echoes the IMSI-derived
+			// IMPU, P-Associated-URI has no tel:/+user entry.
+			logger.Info("VoWiFi IMS registration identities",
+				"category", "vowifi",
+				"event", "ims_registered_identities",
+				"device_id", deviceConfig.ID,
+				"identity_source", evidence.IdentitySource,
+				"p_associated_uri", evidence.PAssociatedURI,
+				"associated_msisdn", evidence.AssociatedMSISDN,
+				"registered_contact", evidence.RegisteredContact,
+			)
 		},
 	})
 	if err != nil {
@@ -1092,6 +1108,10 @@ func newVoWiFiOrchestrator(
 		DeviceID:              deviceConfig.ID,
 		AllowIMSWithoutSMS:    true,
 		IdentityCheckInterval: 15 * time.Second,
+		// Multi-IMSI card: tolerate up to 90 s of IMSI/PLMN drift (DITO <-> Vodafone NL
+		// rotation on a stable ICCID) before treating it as a durable profile switch.
+		IdentityFlapTolerance: 90 * time.Second,
+		Logger:                logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("device %q VoWiFi orchestrator: %w", deviceConfig.ID, err)

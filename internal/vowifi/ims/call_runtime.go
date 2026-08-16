@@ -148,7 +148,8 @@ func (session *Session) DialCall(ctx context.Context, number string) (vowifi.Cal
 	}
 	body := media.offerSDP(session.localMediaIP())
 	transportUpper := strings.ToUpper(session.transport)
-	from := "<" + session.identity.public + ">;tag=" + session.fromTag
+	public := session.publicIdentityForRequest()
+	from := "<" + public + ">;tag=" + session.fromTag
 	to := "<" + target + ">"
 	lines := []string{
 		"INVITE " + target + " SIP/2.0",
@@ -169,7 +170,7 @@ func (session *Session) DialCall(ctx context.Context, number string) (vowifi.Cal
 		"Call-ID: "+callID,
 		fmt.Sprintf("CSeq: %d INVITE", cseq),
 		"Contact: <sip:"+session.identity.user+"@"+session.contactAddress()+";transport="+session.transport+">",
-		"P-Preferred-Identity: <"+session.identity.public+">",
+		"P-Preferred-Identity: <"+public+">",
 		"Allow: INVITE, ACK, CANCEL, BYE, PRACK, OPTIONS, MESSAGE",
 		"Supported: 100rel",
 		"Content-Type: application/sdp",
