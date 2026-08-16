@@ -46,7 +46,7 @@ func newDatagramTransport(
 		config.Dialer = &net.Dialer{}
 	}
 	if config.Timeout <= 0 {
-		config.Timeout = 12 * time.Second
+		config.Timeout = defaultIKETimeout
 	}
 	addresses, err := resolveEPDG(ctx, config.Resolver, host)
 	if err != nil {
@@ -103,7 +103,17 @@ func roundTripDatagram(
 	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
 		deadline = callerDeadline
 	}
-	retransmit := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}
+	// Keep retrying until the configured transaction deadline. The final
+	// interval is capped by that deadline, so a 30-second timeout is not
+	// silently reduced to the previous 7.5-second retry window.
+	retransmit := []time.Duration{
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+	}
 	buffer := make([]byte, 65535)
 	var lastErr error
 	for _, interval := range retransmit {

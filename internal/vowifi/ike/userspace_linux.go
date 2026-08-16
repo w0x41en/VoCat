@@ -25,6 +25,8 @@ const (
 	userspaceTunnelMTU         = 1380
 	maxUserspaceSelectorRoutes = 2048
 	tunReadPollInterval        = 100 * time.Millisecond
+	userspacePriorityMinimum   = 10000
+	userspacePriorityMaximum   = 30000
 )
 
 type linuxUserspaceInstaller struct {
@@ -96,6 +98,15 @@ func (installer linuxUserspaceInstaller) Install(
 	}
 	if _, err := exec.LookPath(command); err != nil {
 		return nil, errors.New("Linux iproute2 is required to configure the user-space CHILD_SA")
+	}
+	// A process restart can close the TUN before it gets a chance to remove
+	// the fail-closed policy rule. Those orphaned rules intentionally return
+	// ENETUNREACH, but a lower-priority orphan can also block the next tunnel
+	// that receives the same inner address. Reconcile only rules whose source
+	// is no longer assigned and whose table contains our unreachable default,
+	// so an active tunnel or unrelated policy route is never removed.
+	if err := cleanupOrphanedUserspaceRouting(ctx, command); err != nil {
+		return nil, err
 	}
 	tunnel, err := newESPTunnel(config, nil)
 	if err != nil {
@@ -476,7 +487,7 @@ func userspaceRoutingIdentifiers(spi uint32) (table uint32, priority uint32) {
 	// Reserve adjacent even/odd priorities for selector lookup followed by a
 	// fail-closed fallback lookup. The latter prevents RPDB from continuing to
 	// the main table if the TUN (and its routes) disappears unexpectedly.
-	priority = 10000 + (spi%10000)*2
+	priority = userspacePriorityMinimum + (spi%10000)*2
 	return table, priority
 }
 
@@ -486,6 +497,196 @@ func userspaceFailClosedRoutingIdentifiers(table, priority uint32) (uint32, uint
 		failClosedTable |= 0xc0000000
 	}
 	return failClosedTable, priority + 1
+}
+
+type linuxAddressInfo struct {
+	Local string `json:"local"`
+}
+
+type linuxAddressDumpEntry struct {
+	Addresses []linuxAddressInfo `json:"addr_info"`
+}
+
+type linuxRoutingRule struct {
+	Priority uint32 `json:"priority"`
+	Source   string `json:"src"`
+	Table    any    `json:"table"`
+}
+
+type linuxPolicyTableState uint8
+
+const (
+	linuxPolicyTableOther linuxPolicyTableState = iota
+	linuxPolicyTableEmpty
+	linuxPolicyTableFailClosed
+)
+
+func cleanupOrphanedUserspaceRouting(ctx context.Context, ipCommand string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var cleanupErrors []error
+	for _, family := range []string{"-4", "-6"} {
+		assigned, err := assignedLinuxAddresses(ctx, ipCommand, family)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		rules, err := linuxRoutingRules(ctx, ipCommand, family)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			continue
+		}
+		for _, rule := range rules {
+			if rule.Priority < userspacePriorityMinimum || rule.Priority >= userspacePriorityMaximum {
+				continue
+			}
+			source, sourcePrefix, sourceNetwork, ok := normalizeLinuxRuleSource(rule.Source)
+			if !ok || linuxAddressSetContains(assigned, source, sourceNetwork) {
+				continue
+			}
+			table := routingTableValue(rule.Table)
+			if table == "" || table == "local" || table == "main" || table == "default" {
+				continue
+			}
+			tableState, err := linuxPolicyTableStateOf(ctx, ipCommand, family, table)
+			if err != nil {
+				cleanupErrors = append(cleanupErrors, err)
+				continue
+			}
+			if tableState != linuxPolicyTableEmpty && tableState != linuxPolicyTableFailClosed {
+				continue
+			}
+			if err := runUserspaceIP(ctx, ipCommand, "remove orphaned policy rule", family, "rule", "delete", "priority", strconv.FormatUint(uint64(rule.Priority), 10), "from", sourcePrefix, "lookup", table); err != nil {
+				cleanupErrors = append(cleanupErrors, err)
+				continue
+			}
+			if tableState == linuxPolicyTableFailClosed {
+				if err := runUserspaceIP(ctx, ipCommand, "remove orphaned fail-closed route", family, "route", "delete", "table", table, "unreachable", "default"); err != nil {
+					cleanupErrors = append(cleanupErrors, err)
+				}
+			}
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func assignedLinuxAddresses(ctx context.Context, ipCommand, family string) ([]net.IP, error) {
+	output, err := exec.CommandContext(ctx, ipCommand, family, "-j", "address", "show").CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("ike: inspect assigned %s addresses: %s", family, message)
+	}
+	var entries []linuxAddressDumpEntry
+	if err := json.Unmarshal(output, &entries); err != nil {
+		return nil, fmt.Errorf("ike: parse assigned %s addresses: %w", family, err)
+	}
+	addresses := make([]net.IP, 0)
+	for _, entry := range entries {
+		for _, item := range entry.Addresses {
+			if address := net.ParseIP(strings.TrimSpace(item.Local)); address != nil {
+				addresses = append(addresses, address)
+			}
+		}
+	}
+	return addresses, nil
+}
+
+func linuxRoutingRules(ctx context.Context, ipCommand, family string) ([]linuxRoutingRule, error) {
+	output, err := exec.CommandContext(ctx, ipCommand, family, "-j", "rule", "show").CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("ike: inspect %s policy rules: %s", family, message)
+	}
+	var rules []linuxRoutingRule
+	if err := json.Unmarshal(output, &rules); err != nil {
+		return nil, fmt.Errorf("ike: parse %s policy rules: %w", family, err)
+	}
+	return rules, nil
+}
+
+func linuxPolicyTableStateOf(ctx context.Context, ipCommand, family, table string) (linuxPolicyTableState, error) {
+	output, err := exec.CommandContext(ctx, ipCommand, family, "-j", "route", "show", "table", table).CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return linuxPolicyTableOther, fmt.Errorf("ike: inspect policy table %s: %s", table, message)
+	}
+	var routes []map[string]any
+	if err := json.Unmarshal(output, &routes); err != nil {
+		return linuxPolicyTableOther, fmt.Errorf("ike: parse policy table %s: %w", table, err)
+	}
+	if len(routes) == 0 {
+		return linuxPolicyTableEmpty, nil
+	}
+	if len(routes) != 1 {
+		return linuxPolicyTableOther, nil
+	}
+	for _, route := range routes {
+		if route["type"] == "unreachable" && route["dst"] == "default" {
+			return linuxPolicyTableFailClosed, nil
+		}
+	}
+	return linuxPolicyTableOther, nil
+}
+
+func normalizeLinuxRuleSource(raw string) (string, string, *net.IPNet, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "all" {
+		return "", "", nil, false
+	}
+	var address net.IP
+	var network *net.IPNet
+	if strings.Contains(raw, "/") {
+		parsedAddress, parsedNetwork, err := net.ParseCIDR(raw)
+		if err != nil {
+			return "", "", nil, false
+		}
+		address = parsedAddress
+		network = parsedNetwork
+	} else {
+		address = net.ParseIP(raw)
+		if address == nil {
+			return "", "", nil, false
+		}
+		bits := 128
+		if address.To4() != nil {
+			address = address.To4()
+			bits = 32
+		}
+		network = &net.IPNet{IP: address, Mask: net.CIDRMask(bits, bits)}
+	}
+	address = append(net.IP(nil), address...)
+	return address.String(), network.String(), network, true
+}
+
+func linuxAddressSetContains(addresses []net.IP, source string, network *net.IPNet) bool {
+	for _, address := range addresses {
+		if address.String() == source || (network != nil && network.Contains(address)) {
+			return true
+		}
+	}
+	return false
+}
+
+func runUserspaceIP(ctx context.Context, ipCommand, operation string, arguments ...string) error {
+	output, err := exec.CommandContext(ctx, ipCommand, arguments...).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if message == "" {
+		message = err.Error()
+	}
+	return fmt.Errorf("ike: %s: %s", operation, message)
 }
 
 func (handle *linuxUserspaceHandle) requireUnusedRoutingSlot(

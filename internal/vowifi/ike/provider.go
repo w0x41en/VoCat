@@ -57,6 +57,8 @@ type Config struct {
 	Resolve func(context.Context, vowifi.SIMIdentity) (Config, error)
 }
 
+const defaultIKETimeout = 30 * time.Second
+
 type Provider struct {
 	config           Config
 	transportFactory func(context.Context, transportConfig, vowifi.ProxyRoute, string) (datagramTransport, error)
@@ -84,7 +86,7 @@ func normalizeProviderConfig(config Config) (Config, error) {
 		return Config{}, errors.New("ike: timeout must not be negative")
 	}
 	if config.Timeout == 0 {
-		config.Timeout = 12 * time.Second
+		config.Timeout = defaultIKETimeout
 	}
 	if config.KeepaliveInterval < 0 {
 		return Config{}, errors.New("ike: keepalive interval must not be negative")

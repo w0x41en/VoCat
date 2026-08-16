@@ -148,6 +148,41 @@ func TestUserspaceRulePriorityAlwaysPrecedesMainRoute(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanedUserspaceRoutingRemovesOnlyUnassignedFailClosedRules(t *testing.T) {
+	t.Parallel()
+	temporary := t.TempDir()
+	logPath := filepath.Join(temporary, "ip.log")
+	scriptPath := filepath.Join(temporary, "ip")
+	script := "#!/bin/sh\n" +
+		"case \"$*\" in\n" +
+		"  '-4 -j address show') printf '%s\\n' '[{\"addr_info\":[{\"local\":\"192.0.2.10\"}]}]' ;;\n" +
+		"  '-6 -j address show') printf '%s\\n' '[]' ;;\n" +
+		"  '-4 -j rule show') printf '%s\\n' '[{\"priority\":11001,\"src\":\"9.157.62.46\",\"table\":\"123\"},{\"priority\":11003,\"src\":\"192.0.2.10\",\"table\":\"456\"}]' ;;\n" +
+		"  '-6 -j rule show') printf '%s\\n' '[]' ;;\n" +
+		"  '-4 -j route show table 123') printf '%s\\n' '[{\"type\":\"unreachable\",\"dst\":\"default\"}]' ;;\n" +
+		"  '-4 -j route show table 456') printf '%s\\n' '[{\"type\":\"unreachable\",\"dst\":\"default\"}]' ;;\n" +
+		"  *) printf '%s\\n' \"$*\" >> " + strconv.Quote(logPath) + " ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupOrphanedUserspaceRouting(context.Background(), scriptPath); err != nil {
+		t.Fatalf("cleanupOrphanedUserspaceRouting() error = %v", err)
+	}
+	encoded, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(encoded)
+	if !strings.Contains(log, "-4 rule delete priority 11001 from 9.157.62.46/32 lookup 123") ||
+		!strings.Contains(log, "-4 route delete table 123 unreachable default") {
+		t.Fatalf("orphaned fail-closed route was not removed:\n%s", log)
+	}
+	if strings.Contains(log, "11003") || strings.Contains(log, "table 456") {
+		t.Fatalf("assigned source policy was removed:\n%s", log)
+	}
+}
+
 func TestUserspaceRouteSetupAndCleanupStayFailClosedAtEveryStep(t *testing.T) {
 	t.Parallel()
 	temporary := t.TempDir()
