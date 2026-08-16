@@ -39,6 +39,10 @@ type Config struct {
 	AllowSHA1 bool
 	// UseMODP1024 explicitly selects DH group 2 instead of the group 14 default.
 	UseMODP1024 bool
+	// LegacyIKEOnly offers exactly one legacy suite. DITO's ePDG rejects a
+	// proposal that contains stronger alternatives, so this is distinct from
+	// AllowSHA1, which keeps strong and legacy transforms in one offer.
+	LegacyIKEOnly bool
 	// EAPTrace receives redacted RX/TX EAP packets while a tunnel is being
 	// negotiated. It is optional and must not be used to log subscriber
 	// identity bytes directly.
@@ -171,7 +175,11 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	// lower-priority compatibility transform for those home PLMNs while keeping
 	// MODP2048 and the strong-first ordering. Other carriers still require the
 	// explicit AllowSHA1 setting before any legacy transform is advertised.
+	legacyIKEOnly := provider.config.LegacyIKEOnly || request.Carrier.LegacyIKEOnly
 	allowSHA1 := provider.config.AllowSHA1 || request.Carrier.AllowSHA1 || telefonicaGermanySHA1Compatibility(request.Identity)
+	if legacyIKEOnly {
+		allowSHA1 = true
+	}
 	eapMethod := provider.config.EAPMethod
 	if eapMethod == "aka" && request.Carrier.EAPMethod != "" {
 		eapMethod = request.Carrier.EAPMethod
@@ -211,7 +219,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	if _, err := io.ReadFull(provider.config.Random, initiatorNonce); err != nil {
 		return nil, fmt.Errorf("ike: generate initiator nonce: %w", err)
 	}
-	ikeProposalBody, err := marshalProposals([]proposal{ikeOffer(group, allowSHA1)})
+	ikeProposalBody, err := marshalProposals([]proposal{ikeOffer(group, allowSHA1, legacyIKEOnly)})
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +351,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		return nil, err
 	}
 	childInboundSPI := binary.BigEndian.Uint32(childInboundSPIBytes[:])
-	childOfferBody, err := marshalProposals([]proposal{espOffer(childInboundSPIBytes[:], allowSHA1)})
+	childOfferBody, err := marshalProposals([]proposal{espOffer(childInboundSPIBytes[:], allowSHA1, legacyIKEOnly)})
 	if err != nil {
 		return nil, err
 	}
@@ -739,13 +747,18 @@ func buildInitialEAPOnlyAuth(
 	return buildInitialEAPAuth(idi, requestedIDr, childOfferBody, tsi, tsr, true)
 }
 
-func ikeOffer(group uint16, allowSHA1 bool) proposal {
+func ikeOffer(group uint16, allowSHA1, legacyOnly bool) proposal {
 	transforms := []transform{
 		{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 128},
-		{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
 	}
-	if allowSHA1 {
+	if legacyOnly {
 		transforms = append(transforms,
+			transform{Type: transformPRF, ID: prfHMACSHA1},
+			transform{Type: transformIntegrity, ID: integrityHMACSHA1_96},
+		)
+	} else if allowSHA1 {
+		transforms = append(transforms,
+			transform{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
 			transform{Type: transformPRF, ID: prfHMACSHA256},
 			transform{Type: transformPRF, ID: prfHMACSHA1},
 			transform{Type: transformIntegrity, ID: integrityHMACSHA256_128},
@@ -753,6 +766,7 @@ func ikeOffer(group uint16, allowSHA1 bool) proposal {
 		)
 	} else {
 		transforms = append(transforms,
+			transform{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
 			transform{Type: transformPRF, ID: prfHMACSHA256},
 			transform{Type: transformIntegrity, ID: integrityHMACSHA256_128},
 		)
@@ -761,18 +775,23 @@ func ikeOffer(group uint16, allowSHA1 bool) proposal {
 	return proposal{Number: 1, Protocol: protocolIKE, Transforms: transforms}
 }
 
-func espOffer(spi []byte, allowSHA1 bool) proposal {
+func espOffer(spi []byte, allowSHA1, legacyOnly bool) proposal {
 	transforms := []transform{
 		{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 128},
-		{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
 	}
-	if allowSHA1 {
+	if legacyOnly {
+		transforms = append(transforms, transform{Type: transformIntegrity, ID: integrityHMACSHA1_96})
+	} else if allowSHA1 {
 		transforms = append(transforms,
+			transform{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
 			transform{Type: transformIntegrity, ID: integrityHMACSHA256_128},
 			transform{Type: transformIntegrity, ID: integrityHMACSHA1_96},
 		)
 	} else {
-		transforms = append(transforms, transform{Type: transformIntegrity, ID: integrityHMACSHA256_128})
+		transforms = append(transforms,
+			transform{Type: transformEncryption, ID: encryptionAESCBC, KeyLength: 256},
+			transform{Type: transformIntegrity, ID: integrityHMACSHA256_128},
+		)
 	}
 	transforms = append(transforms, transform{Type: transformESN, ID: 0})
 	return proposal{Number: 1, Protocol: protocolESP, SPI: append([]byte(nil), spi...), Transforms: transforms}

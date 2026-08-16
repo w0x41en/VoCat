@@ -12,7 +12,7 @@ func TestIKEAuthTraceRedactsIDiAndParsesInitialPayloads(t *testing.T) {
 	identity := "051502123456789@nai.epc.mnc002.mcc515.3gppnetwork.org"
 	idi := payload{Type: payloadIDi, Body: append([]byte{3, 0, 0, 0}, []byte(identity)...)}
 	idr := payload{Type: payloadIDr, Body: append([]byte{2, 0, 0, 0}, []byte("ims")...)}
-	childOffer, err := marshalProposals([]proposal{espOffer([]byte{1, 2, 3, 4}, false)})
+	childOffer, err := marshalProposals([]proposal{espOffer([]byte{1, 2, 3, 4}, false, false)})
 	if err != nil {
 		t.Fatalf("marshal child offer: %v", err)
 	}

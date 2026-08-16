@@ -25,6 +25,7 @@ type CarrierProfile struct {
 	IMSTransport      string `json:"ims_transport,omitempty"`
 	AllowSHA1         bool   `json:"allow_sha1,omitempty"`
 	UseMODP1024       bool   `json:"use_modp1024,omitempty"`
+	LegacyIKEOnly     bool   `json:"legacy_ike_only,omitempty"`
 	IMSIdentitySource string `json:"ims_identity_source,omitempty"`
 }
 
@@ -85,6 +86,7 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		profile.Source = CarrierSourceBuiltin
 		profile.AllowSHA1 = true
 		profile.UseMODP1024 = true
+		profile.LegacyIKEOnly = true
 	case "515002":
 		// Globe Philippines publishes a dedicated static ePDG hostname rather
 		// than the standard PLMN-derived name. Keep the hostname here so DNS

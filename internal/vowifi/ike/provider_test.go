@@ -45,6 +45,7 @@ func (reader constantReader) Read(destination []byte) (int, error) {
 type firstAuthCaptureTransport struct {
 	t            *testing.T
 	allowSHA1    bool
+	legacyOnly   bool
 	useMODP1024  bool
 	calls        int
 	suite        negotiatedSuite
@@ -106,6 +107,17 @@ func (transport *firstAuthCaptureTransport) answerIKEInit(packet []byte) ([]byte
 			"SHA-1 offer PRF=%v integrity=%v, want both %v",
 			hasSHA1PRF, hasSHA1Integrity, transport.allowSHA1,
 		)
+	}
+	if transport.legacyOnly {
+		if got := transformIDs(offers[0], transformEncryption); !equalUint16s(got, []uint16{encryptionAESCBC}) {
+			transport.t.Fatalf("legacy-only IKE encryption = %v, want AES-CBC-128 only", got)
+		}
+		if got := transformIDs(offers[0], transformPRF); !equalUint16s(got, []uint16{prfHMACSHA1}) {
+			transport.t.Fatalf("legacy-only IKE PRF = %v, want HMAC-SHA1 only", got)
+		}
+		if got := transformIDs(offers[0], transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA1_96}) {
+			transport.t.Fatalf("legacy-only IKE integrity = %v, want HMAC-SHA1-96 only", got)
+		}
 	}
 	ke, err := onePayload(payloads, payloadKE)
 	if err != nil {
@@ -485,8 +497,8 @@ func TestTelefonicaGermanySHA1CompatibilityIsCarrierScoped(t *testing.T) {
 }
 
 func TestProviderWeakCryptoRequiresExplicitOptIn(t *testing.T) {
-	strongIKE := ikeOffer(dhMODP2048, false)
-	strongESP := espOffer([]byte{1, 2, 3, 4}, false)
+	strongIKE := ikeOffer(dhMODP2048, false, false)
+	strongESP := espOffer([]byte{1, 2, 3, 4}, false, false)
 	for _, candidate := range append(append([]transform(nil), strongIKE.Transforms...), strongESP.Transforms...) {
 		if candidate.Type == transformPRF && candidate.ID == prfHMACSHA1 ||
 			candidate.Type == transformIntegrity && candidate.ID == integrityHMACSHA1_96 ||
@@ -500,8 +512,8 @@ func TestProviderWeakCryptoRequiresExplicitOptIn(t *testing.T) {
 	if got := transformIDs(strongIKE, transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA256_128}) {
 		t.Fatalf("strong IKE integrity = %v", got)
 	}
-	legacyIKE := ikeOffer(dhMODP1024, true)
-	legacyESP := espOffer([]byte{1, 2, 3, 4}, true)
+	legacyIKE := ikeOffer(dhMODP1024, true, false)
+	legacyESP := espOffer([]byte{1, 2, 3, 4}, true, false)
 	if got := transformIDs(legacyIKE, transformPRF); !equalUint16s(got, []uint16{prfHMACSHA256, prfHMACSHA1}) {
 		t.Fatalf("legacy IKE PRFs = %v", got)
 	}
@@ -511,16 +523,33 @@ func TestProviderWeakCryptoRequiresExplicitOptIn(t *testing.T) {
 	if got := transformIDs(legacyESP, transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA256_128, integrityHMACSHA1_96}) {
 		t.Fatalf("legacy ESP integrity = %v", got)
 	}
-	sha1WithGroup14 := ikeOffer(dhMODP2048, true)
+	sha1WithGroup14 := ikeOffer(dhMODP2048, true, false)
 	if got := transformIDs(sha1WithGroup14, transformDH); !equalUint16s(got, []uint16{dhMODP2048}) {
 		t.Fatalf("SHA-1-compatible group14 offer DH = %v", got)
 	}
-	group2WithSHA256 := ikeOffer(dhMODP1024, false)
+	group2WithSHA256 := ikeOffer(dhMODP1024, false, false)
 	if got := transformIDs(group2WithSHA256, transformPRF); !equalUint16s(got, []uint16{prfHMACSHA256}) {
 		t.Fatalf("group2 strong PRFs = %v", got)
 	}
 	if got := transformIDs(group2WithSHA256, transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA256_128}) {
 		t.Fatalf("group2 strong integrity = %v", got)
+	}
+	legacyOnlyIKE := ikeOffer(dhMODP1024, false, true)
+	legacyOnlyESP := espOffer([]byte{1, 2, 3, 4}, false, true)
+	if got := transformIDs(legacyOnlyIKE, transformEncryption); !equalUint16s(got, []uint16{encryptionAESCBC}) {
+		t.Fatalf("legacy-only IKE encryption = %v", got)
+	}
+	if got := transformIDs(legacyOnlyIKE, transformPRF); !equalUint16s(got, []uint16{prfHMACSHA1}) {
+		t.Fatalf("legacy-only IKE PRF = %v", got)
+	}
+	if got := transformIDs(legacyOnlyIKE, transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA1_96}) {
+		t.Fatalf("legacy-only IKE integrity = %v", got)
+	}
+	if got := transformIDs(legacyOnlyESP, transformEncryption); !equalUint16s(got, []uint16{encryptionAESCBC}) {
+		t.Fatalf("legacy-only ESP encryption = %v", got)
+	}
+	if got := transformIDs(legacyOnlyESP, transformIntegrity); !equalUint16s(got, []uint16{integrityHMACSHA1_96}) {
+		t.Fatalf("legacy-only ESP integrity = %v", got)
 	}
 }
 
@@ -583,7 +612,7 @@ var _ datagramTransport = (*firstAuthCaptureTransport)(nil)
 // hardware, so the carrier preset — not just the per-device toggle — has to be
 // able to select SHA-1 and MODP-1024.
 func TestProviderDITOPhilippinesNegotiatesLegacySuite(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true, useMODP1024: true}
+	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true, legacyOnly: true, useMODP1024: true}
 	provider, err := NewProvider(Config{
 		Random:    constantReader{value: 0x42},
 		Timeout:   time.Second,
