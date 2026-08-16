@@ -705,16 +705,10 @@ func TestNativeQMIListScansUIMAndNVWithTagMetadata(t *testing.T) {
 	}
 }
 
-func TestNativeQMIListPreservesInboundRecordsWhenOptionalTagsAreUnsupported(t *testing.T) {
+func TestNativeQMIListPreservesInboundRecordsWhenOptionalMOTagsAreUnsupported(t *testing.T) {
 	manager, atOpener, id := newStartedNativeSMSManager(t)
 	deliverPDU := "000405912143F500004210203040500005C82293F904"
 	deliverRaw, _ := hex.DecodeString(deliverPDU)
-	unsupportedRead := &qmi.QMIError{
-		Service:   qmi.ServiceWMS,
-		MessageID: qmi.WMSListMessages,
-		Result:    1,
-		ErrorCode: qmi.QMIErrOpDeviceUnsupported,
-	}
 	unsupportedMO := &qmi.QMIError{
 		Service:   qmi.ServiceWMS,
 		MessageID: qmi.WMSListMessages,
@@ -728,8 +722,6 @@ func TestNativeQMIListPreservesInboundRecordsWhenOptionalTagsAreUnsupported(t *t
 			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMTNotRead}: {{Index: 9, Tag: qmi.TagTypeMTNotRead}},
 		},
 		listErrs: map[fakeQMISMSListKey]error{
-			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMTRead}:    unsupportedRead,
-			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMTRead}:     unsupportedRead,
 			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMONotSent}: unsupportedMO,
 			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMONotSent}:  unsupportedMO,
 			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMOSent}:    unsupportedMO,
@@ -749,7 +741,52 @@ func TestNativeQMIListPreservesInboundRecordsWhenOptionalTagsAreUnsupported(t *t
 		t.Fatalf("inbound scan = (%#v, %v)", scan, err)
 	}
 	if atOpener.openCount != 0 {
-		t.Fatalf("unsupported optional tags must not force AT fallback; opens=%d", atOpener.openCount)
+		t.Fatalf("unsupported outbound tags must not force AT fallback; opens=%d", atOpener.openCount)
+	}
+}
+
+// A modem that rejects the MT-read tag cannot list inbound messages it has
+// already flagged as read, so the scan is incomplete even though the MT-unread
+// tag answered. AT CMGL still sees both, and reporting a half-empty inbox is
+// worse than paying for the fallback.
+func TestNativeQMIListFallsBackToATWhenMTReadTagIsUnsupported(t *testing.T) {
+	manager, atOpener, id := newStartedNativeSMSManager(t)
+	readPDU := "000405912143F500004210203040500005C82293F904"
+	unsupportedRead := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		Result:    1,
+		ErrorCode: qmi.QMIErrOpDeviceUnsupported,
+	}
+	session := &fakeQMISMSSession{
+		iccid: "8986001234567890123",
+		imsi:  "515031234567890",
+		listErrs: map[fakeQMISMSListKey]error{
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMTRead}: unsupportedRead,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMTRead}:  unsupportedRead,
+		},
+	}
+	manager.qmiSMSOpener = func(context.Context, string) (qmiSMSSession, error) {
+		return session, nil
+	}
+	atOpener.client = &transcriptClient{steps: []clientStep{
+		{command: "AT+CMGF=0", response: okResponse()},
+		{command: `AT+CPMS="SM"`, response: okResponse()},
+		{command: "AT+CMGL=4", response: okResponse("+CMGL: 7,1,,23", readPDU)},
+		{command: `AT+CPMS="ME"`, response: okResponse()},
+		{command: "AT+CMGL=4", response: okResponse()},
+	}}
+
+	scan, err := manager.ListSMSBoundSubscriber(context.Background(), id)
+	if err != nil || scan.Transport != SMSTransportCellularAT || len(scan.Messages) != 1 ||
+		scan.Messages[0].Text != "HELLO" {
+		t.Fatalf("AT fallback scan = (%#v, %v)", scan, err)
+	}
+	if atOpener.openCount != 1 {
+		t.Fatalf("an unsupported MT-read tag must reach the AT fallback; opens=%d", atOpener.openCount)
+	}
+	if scan.Identity.IMSI != "515031234567890" {
+		t.Fatalf("fallback lost the QMI subscriber identity: %#v", scan.Identity)
 	}
 }
 

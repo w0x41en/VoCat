@@ -336,7 +336,8 @@ func (manager *Manager) ListSMS(
 		}
 		scan, scanErr := manager.listSMSQMILocked(ctx, state, controlDevice)
 		if scanErr != nil && (isQMIWMSContextFailure(scanErr) ||
-			errors.Is(scanErr, errQMIWMSScanSuspended)) {
+			errors.Is(scanErr, errQMIWMSScanSuspended) ||
+			errors.Is(scanErr, errQMIWMSInboundIncomplete)) {
 			scan, scanErr = manager.listSMSNativeATFallbackLocked(ctx, state, controlDevice, scan)
 		}
 		manager.setResult(id, state, nil, scanErr)
@@ -380,7 +381,8 @@ func (manager *Manager) ListSMSBoundSubscriber(
 		}
 		scan, scanErr := manager.listSMSQMILocked(ctx, state, controlDevice)
 		if scanErr != nil && (isQMIWMSContextFailure(scanErr) ||
-			errors.Is(scanErr, errQMIWMSScanSuspended)) {
+			errors.Is(scanErr, errQMIWMSScanSuspended) ||
+			errors.Is(scanErr, errQMIWMSInboundIncomplete)) {
 			scan, scanErr = manager.listSMSNativeATFallbackLocked(ctx, state, controlDevice, scan)
 		}
 		manager.setResult(id, state, nil, scanErr)

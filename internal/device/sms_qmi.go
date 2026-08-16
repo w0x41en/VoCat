@@ -40,6 +40,13 @@ const (
 
 var errQMIWMSScanSuspended = errors.New("QMI WMS SMS scan is suspended")
 
+// errQMIWMSInboundIncomplete marks a scan that succeeded mechanically but
+// could not see every inbound message, because the modem rejects the MT-read
+// list tag. Those messages are only reachable over AT CMGL, so the caller
+// treats this like a context failure and falls back rather than reporting an
+// empty inbox.
+var errQMIWMSInboundIncomplete = errors.New("QMI WMS inbound storage scan is incomplete")
+
 type qmiSMSListEntry struct {
 	Index uint32
 	Tag   qmi.MessageTagType
@@ -1120,9 +1127,18 @@ func (manager *Manager) listSMSQMILockedAttempt(
 					unsupportedAttrs = append(unsupportedAttrs, qmiErrorLogAttrs(listErr)...)
 					manager.logEvent(slog.LevelInfo, "QMI WMS list tag unsupported",
 						unsupportedAttrs...)
-					// Do not mark the storage incomplete: the supported inbound
-					// tags may already have produced records, and an unsupported
-					// optional tag must not force AT fallback for the whole scan.
+					if requestedTag == qmi.TagTypeMTRead {
+						// MT-read is the only tag that lists inbound messages the
+						// modem has already flagged as read, so losing it leaves a
+						// blind spot that AT CMGL can still cover. The MO tags
+						// below are outbound and say nothing about reception, so
+						// they must not drag the whole scan to AT fallback.
+						complete = false
+						lastListErr = fmt.Errorf(
+							"list QMI WMS %s messages with tag %d: %w: %w",
+							storage.name, requestedTag, errQMIWMSInboundIncomplete, listErr,
+						)
+					}
 					continue
 				}
 				if isQMIWMSContextFailure(listErr) {
