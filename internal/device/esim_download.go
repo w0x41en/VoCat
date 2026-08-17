@@ -50,6 +50,9 @@ func (manager *Manager) ESIMDownloadProfile(ctx context.Context, id string, para
 
 	manager.lockESIM()
 	defer manager.unlockESIM()
+	if err := manager.ensureNativeQMIOnlineForESIM(ctx, id); err != nil {
+		return nil, err
+	}
 
 	report("preflight", "正在检查 eUICC 剩余空间...", 10)
 	channel, err := manager.openEuiccAID(ctx, id, targetEuiccAID(params.AIDHex))
@@ -171,6 +174,9 @@ func (manager *Manager) ESIMDownloadProfile(ctx context.Context, id string, para
 // Keep the matching deliberately tolerant because some SM-DP+ implementations
 // return only a free-form statusCodeData.message.
 func ESIMDownloadErrorCode(err error) string {
+	if errors.Is(err, ErrESIMModemUnavailable) {
+		return "esim_modem_unavailable"
+	}
 	var authenticateErr *esimAuthenticateError
 	if errors.As(err, &authenticateErr) {
 		return "euicc_authentication_failed"

@@ -165,6 +165,55 @@ func TestNativeWWANEuiccQMITransmitWaitsForDeviceOperationLock(t *testing.T) {
 	}
 }
 
+func TestEnsureNativeQMIOnlineForESIMRejectsShutdown(t *testing.T) {
+	const id = "wwan0"
+	manager, err := NewManager(Options{
+		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
+			ID:         id,
+			QMIControl: "/dev/wwan0qmi0",
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return &fakeQMIRadioSession{mode: qmi.ModeShutdown}, nil
+	}
+	err = manager.ensureNativeQMIOnlineForESIM(context.Background(), id)
+	if !errors.Is(err, ErrESIMModemUnavailable) {
+		t.Fatalf("shutdown preflight error = %v, want ErrESIMModemUnavailable", err)
+	}
+}
+
+func TestEnsureNativeQMIOnlineForESIMAllowsOnline(t *testing.T) {
+	const id = "wwan0"
+	manager, err := NewManager(Options{
+		Discoverer: staticDiscoverer{candidates: []modem.Candidate{{
+			ID:         id,
+			QMIControl: "/dev/wwan0qmi0",
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return &fakeQMIRadioSession{mode: qmi.ModeOnline}, nil
+	}
+	if err := manager.ensureNativeQMIOnlineForESIM(context.Background(), id); err != nil {
+		t.Fatalf("online preflight: %v", err)
+	}
+}
+
 func (session *fakeDeviceQMIUIMSession) Close() error {
 	session.closed = true
 	return nil

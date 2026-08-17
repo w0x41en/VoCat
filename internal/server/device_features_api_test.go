@@ -102,9 +102,42 @@ func (controller *recordingVoWiFiInvalidator) BeginSubscriberChange(
 
 type recordingESIMDeviceController struct {
 	fakeDeviceController
-	events    *[]string
-	guard     *recordingVoWiFiInvalidator
-	switchErr error
+	events       *[]string
+	guard        *recordingVoWiFiInvalidator
+	switchErr    error
+	downloadErr  error
+	abortRequest func()
+}
+
+func (controller *recordingESIMDeviceController) ESIMDownloadProfile(
+	ctx context.Context,
+	_ string,
+	_ device.EsimDownloadParams,
+	progress func(device.EsimProgress),
+) (*device.EsimDownloadResult, error) {
+	if controller.guard != nil {
+		controller.guard.mu.Lock()
+		held := controller.guard.guardHeld
+		controller.guard.mu.Unlock()
+		if !held {
+			return nil, errors.New("subscriber-change guard was not held during download")
+		}
+	}
+	if controller.events != nil {
+		*controller.events = append(*controller.events, "download")
+	}
+	if progress != nil {
+		progress(device.EsimProgress{Step: "install", Msg: "写卡中", Pct: 80})
+	}
+	if controller.abortRequest != nil {
+		// Stand in for the operator closing the browser mid-write.
+		controller.abortRequest()
+		return nil, ctx.Err()
+	}
+	if controller.downloadErr != nil {
+		return nil, controller.downloadErr
+	}
+	return &device.EsimDownloadResult{ICCID: "8900000000000000002", SpaceDelta: 4096}, nil
 }
 
 func (controller *recordingESIMDeviceController) ESIMSwitchProfile(context.Context, string, string, string) error {
@@ -412,6 +445,174 @@ func TestHandleESIMShapes(t *testing.T) {
 	present.handleESIM(dlNoSmdp, httptest.NewRequest(http.MethodGet, "/esim/actions/download", nil), []string{"actions", "download"}, "dev1", "dev1", true)
 	if dlNoSmdp.Code != http.StatusBadRequest {
 		t.Fatalf("download (no smdp) status = %d, want 400", dlNoSmdp.Code)
+	}
+}
+
+// A download writes to the eUICC for the whole SGP.22 exchange, and on the
+// native 410 the download preflight refuses to run while VoWiFi holds the radio
+// in RF-off. It therefore runs inside the same quiesce/guard transaction as a
+// switch -- but because the active subscriber never changes, VoWiFi is restored
+// afterwards instead of the target card's policy being applied.
+func TestEsimDownloadQuiescesVoWiFiAndRestoresItAfterwards(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(
+		context.Background(),
+		store.Device{ID: "dev1", Name: "410", VoWiFiEnabled: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	events := []string{}
+	controller := &recordingVoWiFiInvalidator{state: vowifi.State{
+		DeviceID: "dev1",
+		Enabled:  true,
+		Active:   true,
+		Phase:    vowifi.PhaseIMSReady,
+	}, events: &events}
+	server := &Server{
+		store:               database,
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices:             &recordingESIMDeviceController{events: &events, guard: controller},
+		vowifi:              controller,
+	}
+
+	response := httptest.NewRecorder()
+	server.handleESIM(
+		response,
+		httptest.NewRequest(http.MethodGet, "/esim/actions/download?smdp=rsp.example.com&matching_id=ABC", nil),
+		[]string{"actions", "download"},
+		"dev1",
+		"dev1",
+		true,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got := strings.Join(events, ","); !strings.HasPrefix(got, "quiesce,begin,download,release") {
+		t.Fatalf("download order = %q", got)
+	}
+	// Stopped for the write, then brought back: a download must not leave the
+	// operator's VoWiFi session switched off.
+	if len(controller.enabled) != 2 || controller.enabled[0] || !controller.enabled[1] {
+		t.Fatalf("VoWiFi requests = %v, want [false true]", controller.enabled)
+	}
+	body := response.Body.String()
+	for _, want := range []string{"vowifi_pause", "vowifi_restore", `"step":"done"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("SSE body is missing %q: %s", want, body)
+		}
+	}
+}
+
+// A failed download must still hand VoWiFi back.
+func TestEsimDownloadRestoresVoWiFiAfterFailure(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(
+		context.Background(),
+		store.Device{ID: "dev1", Name: "410", VoWiFiEnabled: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	events := []string{}
+	controller := &recordingVoWiFiInvalidator{state: vowifi.State{
+		DeviceID: "dev1",
+		Enabled:  true,
+		Active:   true,
+		Phase:    vowifi.PhaseIMSReady,
+	}, events: &events}
+	server := &Server{
+		store:               database,
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices: &recordingESIMDeviceController{
+			events:      &events,
+			guard:       controller,
+			downloadErr: errors.New("SM-DP+ refused the matching ID"),
+		},
+		vowifi: controller,
+	}
+
+	response := httptest.NewRecorder()
+	server.handleESIM(
+		response,
+		httptest.NewRequest(http.MethodGet, "/esim/actions/download?smdp=rsp.example.com", nil),
+		[]string{"actions", "download"},
+		"dev1",
+		"dev1",
+		true,
+	)
+	if len(controller.enabled) != 2 || !controller.enabled[1] {
+		t.Fatalf("VoWiFi requests = %v, want it restored after a failed download", controller.enabled)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"step":"error"`) {
+		t.Fatalf("SSE body is missing the error step: %s", body)
+	}
+	// The card-side failure keeps its download error code; only a quiesce
+	// failure is reported as a VoWiFi problem.
+	if strings.Contains(body, "vowifi_quiesce_failed") {
+		t.Fatalf("card failure was reported as a quiesce failure: %s", body)
+	}
+}
+
+// Closing the browser mid-write cancels the request context, which aborts the
+// download by design. VoWiFi must still come back: the guard release and the
+// restore deliberately do not run on the request context.
+func TestEsimDownloadRestoresVoWiFiAfterClientDisconnect(t *testing.T) {
+	database, err := store.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.UpsertDevice(
+		context.Background(),
+		store.Device{ID: "dev1", Name: "410", VoWiFiEnabled: true},
+	); err != nil {
+		t.Fatal(err)
+	}
+	events := []string{}
+	controller := &recordingVoWiFiInvalidator{state: vowifi.State{
+		DeviceID: "dev1",
+		Enabled:  true,
+		Active:   true,
+		Phase:    vowifi.PhaseIMSReady,
+	}, events: &events}
+	devices := &recordingESIMDeviceController{events: &events, guard: controller}
+	server := &Server{
+		store:               database,
+		logger:              regionTestLogger(),
+		maxRequestBodyBytes: 4096,
+		devices:             devices,
+		vowifi:              controller,
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/esim/actions/download?smdp=rsp.example.com", nil)
+	requestContext, cancelRequest := context.WithCancel(request.Context())
+	request = request.WithContext(requestContext)
+	defer cancelRequest()
+	devices.abortRequest = cancelRequest
+
+	server.handleESIM(httptest.NewRecorder(), request, []string{"actions", "download"}, "dev1", "dev1", true)
+
+	if len(controller.enabled) != 2 || !controller.enabled[1] {
+		t.Fatalf("VoWiFi requests = %v, want it restored after a disconnected download", controller.enabled)
+	}
+	if got := strings.Join(events, ","); !strings.HasPrefix(got, "quiesce,begin,download,release") {
+		t.Fatalf("download order = %q", got)
+	}
+	controller.mu.Lock()
+	held := controller.guardHeld
+	controller.mu.Unlock()
+	if held {
+		t.Fatal("subscriber-change guard was left held after a disconnected download")
 	}
 }
 

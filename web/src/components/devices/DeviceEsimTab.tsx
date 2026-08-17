@@ -234,7 +234,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
     [deviceId, retryingSeq, loadNotifications],
   );
   const loadProfiles = useCallback(
-    async (refresh = false) => {
+    async (refresh = false, quiet = false) => {
       setRefreshing(true);
       try {
         const data = await api<EsimProfileGroup[]>(`/devices/${deviceId}/esim/profiles${refresh ? "?refresh=true" : ""}`);
@@ -242,7 +242,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
         setGroups(next);
         return next;
       } catch (e) {
-        message.error(apiMessage(e) || t("获取 eSIM Profiles 失败"));
+        if (!quiet) message.error(apiMessage(e) || t("获取 eSIM Profiles 失败"));
         return null;
       } finally {
         setRefreshing(false);
@@ -300,7 +300,12 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
           if (streamError) throw new Error(streamError);
           if (!completed) throw new Error(t("切卡流未确认完成"));
           setSwitchPct(100);
-          setGroups((prev) => applySwitchLocal(prev, iccid, aidHex));
+          // The OpenStick can keep the ES10c channel unavailable briefly after
+          // the modem reset. Prefer a fresh list so profile names/states match
+          // the card that QMI already verified; retain the local state update
+          // as a fallback without replacing the previous display name.
+          const refreshed = await loadProfiles(true, true);
+          if (!refreshed) setGroups((prev) => applySwitchLocal(prev, iccid, aidHex));
         }
         if (disabling) {
           message.success(t("Profile 已禁用；模组正在重新初始化，恢复后即可删除"));
@@ -316,7 +321,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
         setSwitchingIccid(null);
       }
     },
-    [deviceId, notifyProfileChanged, t],
+    [deviceId, loadProfiles, notifyProfileChanged, t],
   );
 
   const startRename = useCallback((iccid: string, name?: string) => {
@@ -409,6 +414,7 @@ export function DeviceEsimTab({ deviceId, deviceImei, isActive, deviceOnline, re
                   euicc_ci_incompatible: t("此 SM-DP+ 的证书链不受当前 eUICC 信任；该卡不能使用此测试服务器。"),
                   activation_code_refused: t("激活码已被使用、已过期或被 SM-DP+ 拒绝，请更换新的 Matching ID。"),
                   profile_pool_empty: t("SM-DP+ 的公开 Profile 库存已耗尽，请稍后重试或更换服务。"),
+                  vowifi_quiesce_failed: t("写卡前无法暂停 VoWiFi，请先手动关闭 VoWiFi 后重试。"),
                 };
                 setDownloadErr(friendlyErrors[ev.code] || ev.msg || t("下载失败"));
                 return;

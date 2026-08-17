@@ -119,6 +119,9 @@ func TestESIMDownloadErrorCodePublicProfileFailures(t *testing.T) {
 			t.Errorf("ESIMDownloadErrorCode(%q) = %q, want %q", test.err, got, test.want)
 		}
 	}
+	if got := ESIMDownloadErrorCode(ErrESIMModemUnavailable); got != "esim_modem_unavailable" {
+		t.Fatalf("ESIMDownloadErrorCode(ErrESIMModemUnavailable) = %q, want esim_modem_unavailable", got)
+	}
 }
 
 func TestAuthenticateServerResultError(t *testing.T) {

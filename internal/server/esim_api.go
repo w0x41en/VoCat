@@ -84,7 +84,7 @@ func (s *Server) handleESIM(w http.ResponseWriter, r *http.Request, rest []strin
 			if !requireMethod(w, r, http.MethodGet) {
 				return true
 			}
-			s.handleEsimDownload(w, r, physicalID, physicalPresent)
+			s.handleEsimDownload(w, r, configID, physicalID, physicalPresent)
 			return true
 		}
 		// Any other provisioning action is not implemented.
@@ -359,13 +359,16 @@ func (s *Server) handleEsimSwitch(w http.ResponseWriter, r *http.Request, config
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "switched", "iccid": iccid, "verified": true}})
 }
 
-type esimSwitchFailure struct {
+// esimCardOperationFailure tags which stage of a guarded card transaction
+// failed. Both the profile switch and the profile download run the same
+// quiesce/guard/restore sequence, so both report through this type.
+type esimCardOperationFailure struct {
 	stage string
 	err   error
 }
 
-func (failure *esimSwitchFailure) Error() string { return failure.err.Error() }
-func (failure *esimSwitchFailure) Unwrap() error { return failure.err }
+func (failure *esimCardOperationFailure) Error() string { return failure.err.Error() }
+func (failure *esimCardOperationFailure) Unwrap() error { return failure.err }
 
 // runESIMSwitch is the single transaction used by both the legacy JSON POST
 // and the progress SSE endpoint. progress is invoked only by the device layer;
@@ -380,7 +383,7 @@ func (s *Server) runESIMSwitch(
 ) error {
 	transaction, err := s.quiesceVoWiFiForESIMTransaction(ctx, configID)
 	if err != nil {
-		return &esimSwitchFailure{stage: "quiesce", err: err}
+		return &esimCardOperationFailure{stage: "quiesce", err: err}
 	}
 	if transaction != nil && transaction.physicalID == "" {
 		transaction.physicalID = physicalID
@@ -390,7 +393,7 @@ func (s *Server) runESIMSwitch(
 		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
 			s.logger.Error("restore VoWiFi after subscriber guard failure", "device_id", configID, "error", restoreErr)
 		}
-		return &esimSwitchFailure{stage: "subscriber_guard", err: err}
+		return &esimCardOperationFailure{stage: "subscriber_guard", err: err}
 	}
 	released := false
 	defer func() {
@@ -412,7 +415,7 @@ func (s *Server) runESIMSwitch(
 		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
 			s.logger.Error("restore VoWiFi after failed eSIM switch", "device_id", configID, "error", restoreErr)
 		}
-		return &esimSwitchFailure{stage: "device", err: switchErr}
+		return &esimCardOperationFailure{stage: "device", err: switchErr}
 	}
 	// The device layer verifies the requested ICCID before returning. Reconcile
 	// the target card's stored policy only after that proof is available.
@@ -420,13 +423,77 @@ func (s *Server) runESIMSwitch(
 	released = true
 	if err := s.applyESIMCardPolicy(ctx, configID, physicalID, iccid); err != nil {
 		s.logger.Error("apply target card policy after eSIM switch", "device_id", configID, "iccid", iccid, "error", err)
-		return &esimSwitchFailure{stage: "policy", err: err}
+		return &esimCardOperationFailure{stage: "policy", err: err}
 	}
 	return nil
 }
 
+// runESIMDownload writes one profile to the eUICC inside the same VoWiFi
+// quiesce/guard transaction a switch uses. A download holds the eUICC -- and
+// therefore the QMI control port -- for the whole SGP.22 exchange, and on the
+// native 410 VoWiFi keeps the radio in RF-off while it owns the subscriber,
+// which the download preflight (ensureNativeQMIOnlineForESIM) rejects outright.
+// Quiescing turns both problems into a planned, reversible pause.
+//
+// Unlike a switch this never changes the active subscriber, so the previous
+// card's policy is restored on every outcome rather than only on failure.
+func (s *Server) runESIMDownload(
+	ctx context.Context,
+	configID string,
+	physicalID string,
+	params device.EsimDownloadParams,
+	progress func(device.EsimProgress),
+) (*device.EsimDownloadResult, error) {
+	report := func(step, msg string, pct int) {
+		if progress != nil {
+			progress(device.EsimProgress{Step: step, Msg: msg, Pct: pct})
+		}
+	}
+	// Announce the pause before quiescing: waiting for the runtime to stop can
+	// take up to 30 seconds, and the operator is watching a progress bar.
+	if s.vowifi != nil && strings.TrimSpace(configID) != "" {
+		if state, err := s.vowifi.State(configID); err == nil && (state.Enabled || state.Active) {
+			report("vowifi_pause", "正在暂停 VoWiFi 以释放 SIM 卡（下载完成后自动恢复）...", 5)
+		}
+	}
+	transaction, err := s.quiesceVoWiFiForESIMTransaction(ctx, configID)
+	if err != nil {
+		return nil, &esimCardOperationFailure{stage: "quiesce", err: err}
+	}
+	if transaction != nil && transaction.physicalID == "" {
+		transaction.physicalID = physicalID
+	}
+	releaseSubscriberChange, err := s.beginVoWiFiSubscriberChange(ctx, configID)
+	if err != nil {
+		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
+			s.logger.Error("restore VoWiFi after subscriber guard failure",
+				"device_id", configID, "error", restoreErr)
+		}
+		return nil, &esimCardOperationFailure{stage: "subscriber_guard", err: err}
+	}
+
+	result, downloadErr := s.devices.ESIMDownloadProfile(ctx, physicalID, params, progress)
+
+	// Restore on every path, including a cancelled request: the guard rejects
+	// RequestEnabled while held, so release it first. Neither call takes the
+	// request context, so a disconnected browser still gets VoWiFi back.
+	releaseSubscriberChange()
+	if transaction != nil && transaction.runtimeKnown &&
+		(transaction.previousRuntime.Enabled || transaction.previousRuntime.Active) {
+		report("vowifi_restore", "正在恢复 VoWiFi...", 95)
+	}
+	if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
+		s.logger.Error("restore VoWiFi after eSIM profile download",
+			"device_id", configID, "error", restoreErr)
+	}
+	if downloadErr != nil {
+		return nil, &esimCardOperationFailure{stage: "device", err: downloadErr}
+	}
+	return result, nil
+}
+
 func (s *Server) writeESIMSwitchError(w http.ResponseWriter, err error) {
-	var failure *esimSwitchFailure
+	var failure *esimCardOperationFailure
 	if errors.As(err, &failure) {
 		switch failure.stage {
 		case "quiesce":
@@ -813,7 +880,7 @@ func (s *Server) handleEsimDelete(w http.ResponseWriter, r *http.Request, physic
 // confirmation_code/aid_hex/imei) and reads `data: {step,msg,pct,...}` lines.
 // The event field names (step/msg/pct/code/space_delta/warning) match the
 // reference contract byte-for-byte, so the frontend needs no changes.
-func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, physicalID string, physicalPresent bool) {
+func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, configID string, physicalID string, physicalPresent bool) {
 	if s.devices == nil {
 		writeError(w, http.StatusServiceUnavailable, "device_manager_unavailable", "device manager is unavailable")
 		return
@@ -842,15 +909,22 @@ func (s *Server) handleEsimDownload(w http.ResponseWriter, r *http.Request, phys
 		_ = writeSSEEvent(w, controller, "progress", payload)
 	}
 
-	result, err := s.devices.ESIMDownloadProfile(r.Context(), physicalID, params, func(p device.EsimProgress) {
+	result, err := s.runESIMDownload(r.Context(), configID, physicalID, params, func(p device.EsimProgress) {
 		emit(map[string]any{"step": p.Step, "msg": p.Msg, "pct": p.Pct})
 	})
 	if err != nil {
+		// A quiesce/guard failure is about the VoWiFi runtime, not the card, so
+		// it must not be reported as an SM-DP+/eUICC download error code.
+		code := device.ESIMDownloadErrorCode(err)
+		var failure *esimCardOperationFailure
+		if errors.As(err, &failure) && failure.stage != "device" {
+			code = "vowifi_quiesce_failed"
+		}
 		emit(map[string]any{
 			"step": "error",
 			"msg":  "下载失败: " + err.Error(),
 			"pct":  -1,
-			"code": device.ESIMDownloadErrorCode(err),
+			"code": code,
 		})
 		return
 	}

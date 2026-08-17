@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -30,6 +31,53 @@ type qmiEUICCSession interface {
 }
 
 type qmiEUICCSessionOpener func(context.Context, string) (qmiEUICCSession, error)
+
+// ensureNativeQMIOnlineForESIM verifies the modem control plane before a
+// profile download starts.  OpenStick's MPSS can crash or remain in DMS
+// shutdown after a bad RAT request; QMI-UIM may still enumerate the card in
+// that window, but APDU writes are not safe and otherwise degrade into opaque
+// context deadline errors.  Do not wake a modem that the user intentionally
+// left offline: the caller gets a stable, actionable error instead.
+func (manager *Manager) ensureNativeQMIOnlineForESIM(ctx context.Context, id string) error {
+	controlDevice, native, err := manager.nativeQMIControl(id)
+	if err != nil || !native {
+		return err
+	}
+	if manager.qmiRadioOpener == nil {
+		err = fmt.Errorf("%w: QMI DMS health check is unavailable", ErrESIMModemUnavailable)
+		manager.logEvent(slog.LevelWarn, "eSIM profile download blocked",
+			"category", "esim", "event", "profile_download_preflight_failed",
+			"device_id", id, "error", err.Error())
+		return err
+	}
+	checkContext, cancel := manager.withTimeout(ctx, manager.commandTimeout)
+	defer cancel()
+	session, err := manager.qmiRadioOpener(checkContext, controlDevice)
+	if err != nil {
+		err = fmt.Errorf("%w: open QMI DMS health session: %w", ErrESIMModemUnavailable, err)
+		manager.logEvent(slog.LevelWarn, "eSIM profile download blocked",
+			"category", "esim", "event", "profile_download_preflight_failed",
+			"device_id", id, "error", err.Error())
+		return err
+	}
+	defer session.Close()
+	mode, err := session.GetOperatingMode(checkContext)
+	if err != nil {
+		err = fmt.Errorf("%w: read QMI operating mode: %w", ErrESIMModemUnavailable, err)
+		manager.logEvent(slog.LevelWarn, "eSIM profile download blocked",
+			"category", "esim", "event", "profile_download_preflight_failed",
+			"device_id", id, "error", err.Error())
+		return err
+	}
+	if mode != qmi.ModeOnline {
+		err = fmt.Errorf("%w: QMI operating mode is 0x%02x; recover the modem to online before writing eUICC", ErrESIMModemUnavailable, uint8(mode))
+		manager.logEvent(slog.LevelWarn, "eSIM profile download blocked",
+			"category", "esim", "event", "profile_download_preflight_failed",
+			"device_id", id, "operating_mode", uint8(mode), "error", err.Error())
+		return err
+	}
+	return nil
+}
 
 type qmiEUICCChannelBackend struct {
 	manager       *Manager
@@ -265,7 +313,7 @@ func openQMIEUICCSession(
 	openStartedAt := time.Now()
 	openContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	lease, err := qmiport.Acquire(openContext, controlDevice)
+	lease, err := qmiport.Acquire(openContext, controlDevice, "esim-uim")
 	gateMs := time.Since(openStartedAt).Milliseconds()
 	if err != nil {
 		recordQMIOpenTiming(ctx, time.Since(openStartedAt).Milliseconds(), gateMs, 0, 0, err)

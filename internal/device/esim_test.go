@@ -496,6 +496,31 @@ func TestMarkCachedProfileEnabled(t *testing.T) {
 	}
 }
 
+func TestMarkCachedProfileEnabledUpdatesInventoryActiveName(t *testing.T) {
+	manager := &Manager{
+		esimInventoryCache: map[string][]EsimInventoryEntry{
+			"dev": {{Info: EsimInfo{Profiles: []EsimProfile{
+				{ICCID: "89441000400316034372", Name: "Vodafone UK eSIM", State: 1},
+				{ICCID: "89634261387110862674", Name: "Globe PH eSIM", State: 0},
+			}}}},
+		},
+		esimActiveName: map[string]string{"dev": "Vodafone UK eSIM"},
+	}
+
+	manager.markCachedProfileEnabled("dev", "89634261387110862674")
+	if got := manager.ActiveESIMProfileName("dev"); got != "Globe PH eSIM" {
+		t.Fatalf("inventory active profile name = %q, want Globe PH eSIM", got)
+	}
+}
+
+func TestMarkCachedProfileEnabledFallsBackToVerifiedICCID(t *testing.T) {
+	manager := &Manager{esimActiveName: map[string]string{"dev": "Vodafone UK eSIM"}}
+	manager.markCachedProfileEnabled("dev", "89634261387110862674")
+	if got := manager.ActiveESIMProfileName("dev"); got != "89634261387110862674" {
+		t.Fatalf("fallback active profile name = %q, want verified ICCID", got)
+	}
+}
+
 func TestMergeVerifiedProfileSnapshotPublishesLiveICCID(t *testing.T) {
 	manager, id := newStartedTestManager(t, &transcriptClient{})
 	state, err := manager.lookup(id)

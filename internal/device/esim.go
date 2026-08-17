@@ -67,11 +67,12 @@ func targetEuiccAID(aidHex string) string {
 }
 
 var (
-	errNoLogicalChannel  = errors.New("esim: modem could not open a logical channel")
-	errNoEUICC           = errors.New("esim: no eUICC (ISD-R) found on the inserted card")
-	errESIMSW            = errors.New("esim: eUICC returned an error status word")
-	errESIMRecovering    = errors.New("esim: profile-switch recovery is in progress")
-	errEUICCChannelStuck = errors.New("esim: eUICC APDU channel is unavailable until the modem restarts")
+	errNoLogicalChannel     = errors.New("esim: modem could not open a logical channel")
+	errNoEUICC              = errors.New("esim: no eUICC (ISD-R) found on the inserted card")
+	errESIMSW               = errors.New("esim: eUICC returned an error status word")
+	errESIMRecovering       = errors.New("esim: profile-switch recovery is in progress")
+	errEUICCChannelStuck    = errors.New("esim: eUICC APDU channel is unavailable until the modem restarts")
+	errESIMModemUnavailable = errors.New("esim: modem is not ready for eUICC operations")
 )
 
 // ErrNoEUICC is returned when the inserted card exposes no eUICC ISD-R, so the
@@ -89,6 +90,12 @@ var ErrESIMSwitchInProgress = errors.New("esim: another profile switch is alread
 // and slot power cycle. Repeating the same request cannot safely improve that
 // state; the modem or host must be restarted.
 var ErrEUICCChannelStuck = errEUICCChannelStuck
+
+// ErrESIMModemUnavailable means that a native WWAN modem is still resetting,
+// shutting down, or otherwise cannot provide a stable QMI-UIM transport.  A
+// profile write must fail before opening the APDU channel in this state; doing
+// so only produces a misleading generic QMI timeout and can race recovery.
+var ErrESIMModemUnavailable = errESIMModemUnavailable
 
 // EsimProfile is one eUICC profile decoded from GetProfilesInfo.
 type EsimProfile struct {
@@ -1276,7 +1283,7 @@ func (manager *Manager) markCachedProfileEnabled(id, iccid string) {
 	info, ok := manager.esimCache[id]
 	if ok {
 		for index := range info.Profiles {
-			if info.Profiles[index].ICCID == iccid {
+			if strings.EqualFold(strings.TrimSpace(info.Profiles[index].ICCID), strings.TrimSpace(iccid)) {
 				info.Profiles[index].State = 1
 				info.Profiles[index].StateText = i18n.T("已启用")
 			} else {
@@ -1285,10 +1292,59 @@ func (manager *Manager) markCachedProfileEnabled(id, iccid string) {
 			}
 		}
 		manager.esimCache[id] = info
-		manager.updateActiveESIMProfileNameLocked(id, info)
 	}
 	manager.updateCachedInventoryProfileStateLocked(id, iccid, true)
+	// ESIMInventory (used by the device overview) has its own cache from the
+	// profile-list cache above.  Keep the display name in sync with both caches;
+	// otherwise a verified switch can update the live ICCID while the overview
+	// continues to show the previous profile name (for example Vodafone UK).
+	manager.refreshActiveESIMProfileNameLocked(id, iccid)
 	manager.esimCacheMu.Unlock()
+}
+
+// refreshActiveESIMProfileNameLocked derives the overview label from the most
+// recently known enabled profile.  A successful QMI ICCID verification is
+// authoritative even when ES10c GetProfilesInfo is temporarily unavailable,
+// so fallback is the verified ICCID rather than a stale previous name.
+// The caller must hold esimCacheMu.
+func (manager *Manager) refreshActiveESIMProfileNameLocked(id, fallbackICCID string) {
+	name := ""
+	// The inventory cache is the source used by the eSIM overview endpoint, so
+	// prefer it when both caches exist but were populated at different times.
+	if entries, ok := manager.esimInventoryCache[id]; ok {
+		for _, entry := range entries {
+			for _, profile := range entry.Info.Profiles {
+				if profile.State == 1 {
+					name = firstNonEmptyString(profile.Name, profile.Nickname, profile.ServiceProvider, profile.ICCID)
+					break
+				}
+			}
+			if name != "" {
+				break
+			}
+		}
+	}
+	if name == "" {
+		if info, ok := manager.esimCache[id]; ok {
+			for _, profile := range info.Profiles {
+				if profile.State == 1 {
+					name = firstNonEmptyString(profile.Name, profile.Nickname, profile.ServiceProvider, profile.ICCID)
+					break
+				}
+			}
+		}
+	}
+	if name == "" {
+		name = strings.TrimSpace(fallbackICCID)
+	}
+	if manager.esimActiveName == nil {
+		manager.esimActiveName = make(map[string]string)
+	}
+	if name == "" {
+		delete(manager.esimActiveName, id)
+	} else {
+		manager.esimActiveName[id] = name
+	}
 }
 
 // updateActiveESIMProfileNameLocked keeps the overview's cache-only profile
@@ -1317,16 +1373,16 @@ func (manager *Manager) markCachedProfileDisabled(id, iccid string) {
 	info, ok := manager.esimCache[id]
 	if ok {
 		for index := range info.Profiles {
-			if info.Profiles[index].ICCID == iccid {
+			if strings.EqualFold(strings.TrimSpace(info.Profiles[index].ICCID), strings.TrimSpace(iccid)) {
 				info.Profiles[index].State = 0
 				info.Profiles[index].StateText = i18n.T("已禁用")
 				break
 			}
 		}
 		manager.esimCache[id] = info
-		manager.updateActiveESIMProfileNameLocked(id, info)
 	}
 	manager.updateCachedInventoryProfileStateLocked(id, iccid, false)
+	manager.refreshActiveESIMProfileNameLocked(id, "")
 	manager.esimCacheMu.Unlock()
 }
 
