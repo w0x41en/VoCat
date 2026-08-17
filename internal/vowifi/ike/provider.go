@@ -28,9 +28,13 @@ type Config struct {
 	ServerName         string
 	Timeout            time.Duration
 	KeepaliveInterval  time.Duration
-	Installer          ChildSAInstaller
-	IdentityType       uint8
-	APN                string
+	// ChildSALifetime is the conservative lifetime of an established ESP
+	// CHILD_SA. The provider proactively lets the runtime reconnect before a
+	// modem/ePDG lifetime or ESP sequence limit becomes a hard failure.
+	ChildSALifetime time.Duration
+	Installer       ChildSAInstaller
+	IdentityType    uint8
+	APN             string
 	// EAPMethod is an explicit anti-downgrade policy: "aka" (type 23) or
 	// "aka-prime" (type 50). Automatic fallback is intentionally unsupported.
 	EAPMethod string
@@ -57,7 +61,10 @@ type Config struct {
 	Resolve func(context.Context, vowifi.SIMIdentity) (Config, error)
 }
 
-const defaultIKETimeout = 30 * time.Second
+const (
+	defaultIKETimeout      = 30 * time.Second
+	defaultChildSALifetime = 50 * time.Minute
+)
 
 type Provider struct {
 	config           Config
@@ -93,6 +100,12 @@ func normalizeProviderConfig(config Config) (Config, error) {
 	}
 	if config.KeepaliveInterval == 0 {
 		config.KeepaliveInterval = 20 * time.Second
+	}
+	if config.ChildSALifetime < 0 {
+		return Config{}, errors.New("ike: CHILD_SA lifetime must not be negative")
+	}
+	if config.ChildSALifetime == 0 {
+		config.ChildSALifetime = defaultChildSALifetime
 	}
 	if config.IdentityType == 0 {
 		config.IdentityType = 3 // ID_RFC822_ADDR, carrying the permanent NAI.
@@ -152,6 +165,9 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		}
 		if resolved.Installer == nil {
 			resolved.Installer = provider.config.Installer
+		}
+		if resolved.ChildSALifetime == 0 {
+			resolved.ChildSALifetime = provider.config.ChildSALifetime
 		}
 		if resolved.EAPTrace == nil {
 			resolved.EAPTrace = provider.config.EAPTrace
@@ -399,7 +415,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	}
 	authResponse, err := transport.RoundTrip(ctx, authRequest)
 	if err != nil {
-		return nil, err
+		return nil, annotateIKEAuthRoundTripError(authResponse, err)
 	}
 	authResponseHeader, authResponsePayloads, err := decryptAndValidate(
 		authResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, 1, ikeSuite, keys,
@@ -446,6 +462,12 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	messageID := uint32(1)
 	currentPayloads := authResponsePayloads
 	for round := 0; round < 10; round++ {
+		// Error notifications carry the real ePDG rejection reason. Inspect
+		// them before requiring an EAP payload, otherwise AUTHENTICATION_FAILED
+		// and friends get misreported as a generic payload-shape error.
+		if err := rejectFatalNotifications(currentPayloads); err != nil {
+			return nil, err
+		}
 		eapPayload, err := onePayload(currentPayloads, payloadEAP)
 		if err != nil {
 			return nil, fmt.Errorf("ike: IKE_AUTH EAP round %d: %w", round+1, err)
@@ -498,7 +520,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		}
 		eapResponse, err := transport.RoundTrip(ctx, eapRequest)
 		if err != nil {
-			return nil, err
+			return nil, annotateIKEAuthRoundTripError(eapResponse, err)
 		}
 		_, currentPayloads, err = decryptAndValidate(
 			eapResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, messageID, ikeSuite, keys,
@@ -537,7 +559,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	}
 	finalResponse, err := transport.RoundTrip(ctx, finalRequest)
 	if err != nil {
-		return nil, err
+		return nil, annotateIKEAuthRoundTripError(finalResponse, err)
 	}
 	_, finalPayloads, err := decryptAndValidate(
 		finalResponse, initiatorSPI, responseHeader.ResponderSPI, exchangeIKEAuth, messageID, ikeSuite, keys,
@@ -645,6 +667,8 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		messageID+1,
 		natDetected,
 		provider.config.KeepaliveInterval,
+		childInboundSPI,
+		childOutboundSPI,
 	)
 	installed, err := provider.config.Installer.Install(ctx, ChildSAConfig{
 		Name:               name,
@@ -711,6 +735,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		relay:     relay,
 		transport: transport,
 	}
+	session.startFailureMonitor(provider.config.ChildSALifetime)
 	closeTransport = false
 	return session, nil
 }
@@ -766,7 +791,6 @@ func buildInitialEAPAuth(
 		payloads = append(payloads, makeNotify(notifyEAPOnlyAuth, nil))
 	}
 	payloads = append(payloads,
-		makeNotify(notifyMOBIKESupported, nil),
 		makeNotify(notifyInitialContact, nil),
 	)
 	return append(payloads,
@@ -893,6 +917,25 @@ func decryptAndValidate(
 		return ikeHeader{}, nil, fmt.Errorf("%w: encrypted response header does not match the request", errUnexpectedPacket)
 	}
 	return header, payloads, nil
+}
+
+// annotateIKEAuthRoundTripError keeps ordinary transport errors intact while
+// making the particularly opaque zero-byte IKE_AUTH timeout actionable. A
+// responder that sends a fragmented IKE_AUTH can produce exactly this symptom;
+// VoCat currently does not advertise or reassemble IKE_FRAGMENTATION.
+func annotateIKEAuthRoundTripError(response []byte, err error) error {
+	if err == nil || len(response) != 0 {
+		return err
+	}
+	var timeout net.Error
+	if !errors.Is(err, context.DeadlineExceeded) &&
+		(!errors.As(err, &timeout) || !timeout.Timeout()) {
+		return err
+	}
+	return fmt.Errorf(
+		"ike: IKE_AUTH response timed out before any bytes; peer may be using IKE fragmentation unsupported by this client: %w",
+		err,
+	)
 }
 
 func rejectFatalNotifications(payloads []payload) error {
@@ -1067,13 +1110,69 @@ type NetworkEvidence struct {
 }
 
 type Session struct {
-	mu        sync.Mutex
-	evidence  vowifi.TunnelEvidence
-	network   NetworkEvidence
-	child     ChildSAHandle
-	relay     *sessionRelay
-	transport datagramTransport
-	closed    bool
+	mu          sync.Mutex
+	evidence    vowifi.TunnelEvidence
+	network     NetworkEvidence
+	child       ChildSAHandle
+	relay       *sessionRelay
+	transport   datagramTransport
+	closed      bool
+	failures    chan error
+	failureStop chan struct{}
+	failureDone chan struct{}
+}
+
+// ErrChildSALifetimeExpired asks the long-lived runtime to tear down and
+// establish a fresh tunnel before the peer's CHILD_SA or the ESP sequence
+// space becomes a hard failure. Reconnect enters the normal orchestrator path,
+// including the SIM identity gate and a new EAP-AKA exchange.
+var ErrChildSALifetimeExpired = errors.New("ike: CHILD_SA lifetime expired; reconnect required")
+
+func (session *Session) startFailureMonitor(lifetime time.Duration) {
+	if session == nil || lifetime <= 0 {
+		return
+	}
+	session.failures = make(chan error, 1)
+	session.failureStop = make(chan struct{})
+	session.failureDone = make(chan struct{})
+	var childFailures <-chan error
+	if notifier, ok := session.child.(DataplaneFailureNotifier); ok {
+		childFailures = notifier.Failures()
+	}
+	go func() {
+		defer close(session.failureDone)
+		timer := time.NewTimer(lifetime)
+		defer timer.Stop()
+		for {
+			select {
+			case err, ok := <-childFailures:
+				if !ok {
+					childFailures = nil
+					continue
+				}
+				if err == nil {
+					err = errors.New("ike: CHILD_SA dataplane stopped")
+				}
+				session.publishFailure(err)
+				return
+			case <-timer.C:
+				session.publishFailure(ErrChildSALifetimeExpired)
+				return
+			case <-session.failureStop:
+				return
+			}
+		}
+	}()
+}
+
+func (session *Session) publishFailure(err error) {
+	if session == nil || err == nil {
+		return
+	}
+	select {
+	case session.failures <- err:
+	default:
+	}
 }
 
 func (session *Session) Evidence() vowifi.TunnelEvidence {
@@ -1096,6 +1195,9 @@ func (session *Session) Network() NetworkEvidence {
 func (session *Session) Failures() <-chan error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
+	if session.failures != nil {
+		return session.failures
+	}
 	if notifier, ok := session.child.(DataplaneFailureNotifier); ok {
 		return notifier.Failures()
 	}
@@ -1112,16 +1214,28 @@ func (session *Session) Close(ctx context.Context) error {
 	child := session.child
 	relay := session.relay
 	transport := session.transport
+	failureStop := session.failureStop
+	failureDone := session.failureDone
 	session.evidence.Established = false
 	session.child = nil
 	session.relay = nil
 	session.transport = nil
+	session.failureStop = nil
+	session.failureDone = nil
 	session.mu.Unlock()
+	if failureStop != nil {
+		close(failureStop)
+		if failureDone != nil {
+			<-failureDone
+		}
+	}
 	var errs []error
 	// Stop the relay first so a userspace CHILD_SA cannot remain blocked in an
 	// inbound ESP receive while Close waits for its data-plane workers.
 	if relay != nil {
-		if err := relay.Close(); err != nil {
+		if err := relay.Close(); err != nil &&
+			!errors.Is(err, ErrPeerDeletedIKESA) &&
+			!errors.Is(err, ErrPeerDeletedChildSA) {
 			errs = append(errs, fmt.Errorf("close session relay: %w", err))
 		}
 	}

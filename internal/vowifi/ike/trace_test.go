@@ -30,8 +30,8 @@ func TestIKEAuthTraceRedactsIDiAndParsesInitialPayloads(t *testing.T) {
 	if event.Direction != "tx" || event.Exchange != "IKE_AUTH" || event.MessageID != 1 {
 		t.Fatalf("trace envelope = %#v", event)
 	}
-	if len(event.Payloads) != 10 {
-		t.Fatalf("trace payload count = %d, want 10", len(event.Payloads))
+	if len(event.Payloads) != 9 {
+		t.Fatalf("trace payload count = %d, want 9", len(event.Payloads))
 	}
 	if event.Payloads[1].Name != "CERTREQ" {
 		t.Fatalf("CERTREQ trace = %#v", event.Payloads[1])
@@ -66,16 +66,16 @@ func TestIKEAuthTraceRedactsIDiAndParsesInitialPayloads(t *testing.T) {
 		t.Fatalf("IDr raw = %q", tracedIDr.RawHexRedacted)
 	}
 
-	tracedSA := event.Payloads[6]
+	tracedSA := event.Payloads[5]
 	if tracedSA.Name != "SA" || tracedSA.ProposalCount != 1 || tracedSA.ParseError != "" {
 		t.Fatalf("SA trace = %#v", tracedSA)
 	}
-	for _, index := range []int{7, 8} {
+	for _, index := range []int{6, 7} {
 		if event.Payloads[index].TrafficSelectorCount != 2 || event.Payloads[index].ParseError != "" {
 			t.Fatalf("traffic selector trace[%d] = %#v", index, event.Payloads[index])
 		}
 	}
-	configuration := event.Payloads[9]
+	configuration := event.Payloads[8]
 	if configuration.ConfigurationType != configRequest || len(configuration.ConfigurationAttributes) != 7 {
 		t.Fatalf("CFG trace = %#v", configuration)
 	}

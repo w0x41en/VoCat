@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,7 @@ type firstAuthCaptureTransport struct {
 	nonceR       []byte
 	identityType uint8
 	floated      bool
+	fatalNotify  uint16
 }
 
 func (transport *firstAuthCaptureTransport) LocalAddr() *net.UDPAddr {
@@ -78,7 +80,20 @@ func (transport *firstAuthCaptureTransport) RoundTrip(_ context.Context, packet 
 	case 1:
 		return transport.answerIKEInit(packet)
 	case 2:
-		return nil, transport.observeFirstAuth(packet)
+		if err := transport.observeFirstAuth(packet); err != nil && !errors.Is(err, errFirstAuthObserved) {
+			return nil, err
+		}
+		if transport.fatalNotify != 0 {
+			response, err := encryptPayloads(ikeHeader{
+				InitiatorSPI: transport.spii,
+				ResponderSPI: transport.spir,
+				Exchange:     exchangeIKEAuth,
+				Flags:        flagResponse,
+				MessageID:    1,
+			}, []payload{makeNotify(transport.fatalNotify, nil)}, transport.suite, transport.keys.SKer, transport.keys.SKar, bytes.NewReader(bytes.Repeat([]byte{0x45}, 64)))
+			return response, err
+		}
+		return nil, errFirstAuthObserved
 	default:
 		return nil, errors.New("test: unexpected exchange")
 	}
@@ -278,6 +293,29 @@ func (child relayOrderedChild) Close(ctx context.Context) error {
 	}
 }
 
+type lifetimeTestChild struct {
+	failures chan error
+}
+
+func (child *lifetimeTestChild) Close(context.Context) error { return nil }
+func (child *lifetimeTestChild) Failures() <-chan error      { return child.failures }
+
+func TestSessionFailureMonitorRequestsReconnectBeforeLifetimeExpiry(t *testing.T) {
+	session := &Session{child: &lifetimeTestChild{failures: make(chan error)}}
+	session.startFailureMonitor(10 * time.Millisecond)
+	select {
+	case err := <-session.Failures():
+		if !errors.Is(err, ErrChildSALifetimeExpired) {
+			t.Fatalf("failure = %v, want ErrChildSALifetimeExpired", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session lifetime monitor did not signal a reconnect")
+	}
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("close session after lifetime failure: %v", err)
+	}
+}
+
 func TestSessionCloseStopsRelayBeforeChildDataplane(t *testing.T) {
 	t.Parallel()
 	transport := newFakeSessionTransport()
@@ -346,6 +384,41 @@ func TestProviderVodafoneFirstAuthIsEAPOnlyAndRequestsIMSAPN(t *testing.T) {
 	}
 }
 
+func TestProviderEAPAuthReportsFatalNotifyBeforeMissingEAP(t *testing.T) {
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: true, fatalNotify: 24}
+	provider, err := NewProvider(Config{
+		Random:    constantReader{value: 0x42},
+		Timeout:   time.Second,
+		Installer: unusedInstaller{},
+		APN:       "ims",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.transportFactory = func(context.Context, transportConfig, vowifi.ProxyRoute, string) (datagramTransport, error) {
+		return capture, nil
+	}
+	_, err = provider.Start(context.Background(), vowifi.TunnelRequest{
+		DeviceID: "ec20-1",
+		Identity: vowifi.SIMIdentity{ICCID: "8944100000000000000", IMSI: "234150123456789", HomeMCC: "234", HomeMNC: "15"},
+		EPDG:     "epdg.epc.mnc015.mcc234.pub.3gppnetwork.org",
+		AKA:      &testAKAProvider{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "24") || strings.Contains(err.Error(), "expected one payload type 48") {
+		t.Fatalf("Start() fatal notify error = %v, want notification 24 rather than missing EAP", err)
+	}
+}
+
+func TestAnnotateIKEAuthTimeoutMentionsPossibleFragmentation(t *testing.T) {
+	err := annotateIKEAuthRoundTripError(nil, context.DeadlineExceeded)
+	if err == nil || !strings.Contains(err.Error(), "fragmentation") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("annotated timeout = %v, want fragmentation hint and preserved timeout", err)
+	}
+	if got := annotateIKEAuthRoundTripError([]byte{1}, context.DeadlineExceeded); !errors.Is(got, context.DeadlineExceeded) || strings.Contains(got.Error(), "fragmentation") {
+		t.Fatalf("partial response timeout = %v, should remain the original timeout", got)
+	}
+}
+
 func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
 	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: false}
 	var traced IKEAuthTraceEvent
@@ -390,7 +463,7 @@ func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
 	if capture.identityType != 3 {
 		t.Fatalf("Globe IKE identity type = %d, want RFC822_ADDR / NAI (3)", capture.identityType)
 	}
-	if !traceSeen || traced.MessageID != 1 || len(traced.Payloads) != 9 {
+	if !traceSeen || traced.MessageID != 1 || len(traced.Payloads) != 8 {
 		t.Fatalf("Globe initial IKE_AUTH trace = %#v", traced)
 	}
 	if traced.Payloads[0].IdentityPrefix != "051502" || traced.Payloads[2].IdentityValue != "ims" {

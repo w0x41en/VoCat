@@ -61,7 +61,7 @@ func TestInitialEAPOnlyAuthCarriesAPNIDrAndNotify(t *testing.T) {
 		dualStackTrafficSelectors(payloadTSi),
 		dualStackTrafficSelectors(payloadTSr),
 	)
-	if len(payloads) != 10 || payloads[0].Type != payloadIDi ||
+	if len(payloads) != 9 || payloads[0].Type != payloadIDi ||
 		payloads[1].Type != payloadCertReq || payloads[2].Type != payloadIDr {
 		t.Fatalf("initial auth payload order = %#v", payloads)
 	}
@@ -81,13 +81,6 @@ func TestInitialEAPOnlyAuthCarriesAPNIDrAndNotify(t *testing.T) {
 		t.Fatalf("notify = %d/%x, want EAP_ONLY_AUTHENTICATION", kind, data)
 	}
 	kind, data, err = parseNotify(payloads[4])
-	if err != nil {
-		t.Fatalf("parseNotify() error = %v", err)
-	}
-	if kind != notifyMOBIKESupported || len(data) != 0 {
-		t.Fatalf("notify = %d/%x, want MOBIKE_SUPPORTED", kind, data)
-	}
-	kind, data, err = parseNotify(payloads[5])
 	if err != nil {
 		t.Fatalf("parseNotify() error = %v", err)
 	}
@@ -120,12 +113,11 @@ func TestInitialStandardEAPAuthOmitsEAPOnlyNotify(t *testing.T) {
 		dualStackTrafficSelectors(payloadTSr),
 		false,
 	)
-	if len(payloads) != 9 || payloads[0].Type != payloadIDi ||
+	if len(payloads) != 8 || payloads[0].Type != payloadIDi ||
 		payloads[1].Type != payloadCertReq || payloads[2].Type != payloadIDr {
 		t.Fatalf("initial standard EAP payload order = %#v", payloads)
 	}
 	initialContact := 0
-	mobikeSupported := 0
 	for _, item := range payloadsOfType(payloads, payloadNotify) {
 		kind, _, err := parseNotify(item)
 		if err != nil {
@@ -137,17 +129,11 @@ func TestInitialStandardEAPAuthOmitsEAPOnlyNotify(t *testing.T) {
 		if kind == notifyInitialContact {
 			initialContact++
 		}
-		if kind == notifyMOBIKESupported {
-			mobikeSupported++
-		}
 	}
 	if initialContact != 1 {
 		t.Fatalf("standard EAP initial request INITIAL_CONTACT count = %d, want 1", initialContact)
 	}
-	if mobikeSupported != 1 {
-		t.Fatalf("standard EAP initial request MOBIKE_SUPPORTED count = %d, want 1", mobikeSupported)
-	}
-	if payloads[3].Type != payloadNotify || payloads[4].Type != payloadNotify {
+	if payloads[3].Type != payloadNotify || payloads[4].Type != payloadSA {
 		t.Fatalf("standard EAP Android notify order = %#v", payloads[:5])
 	}
 }

@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	errESPAuthentication = errors.New("ike: ESP authentication failed")
-	errESPReplay         = errors.New("ike: ESP packet is outside the replay window")
-	errESPPolicyDrop     = errors.New("ike: ESP packet is not eligible for this CHILD_SA")
+	errESPAuthentication    = errors.New("ike: ESP authentication failed")
+	errESPReplay            = errors.New("ike: ESP packet is outside the replay window")
+	errESPPolicyDrop        = errors.New("ike: ESP packet is not eligible for this CHILD_SA")
+	ErrESPSequenceExhausted = errors.New("ike: ESP sequence number exhausted; rekey is required")
 )
 
 // espTunnel protects complete IPv4 or IPv6 packets using an IKEv2 CHILD_SA.
@@ -206,7 +207,7 @@ func (direction *espDirection) seal(innerPacket []byte, nextHeader uint8) ([]byt
 	defer direction.mu.Unlock()
 
 	if direction.sequence == math.MaxUint32 {
-		return nil, errors.New("ike: ESP sequence number exhausted; rekey is required")
+		return nil, ErrESPSequenceExhausted
 	}
 	direction.sequence++
 	sequence := direction.sequence

@@ -180,6 +180,31 @@ func TestEAPAKAPrimeExplicitPolicyRejectsType23Downgrade(t *testing.T) {
 		!bytes.Equal(response.Data, []byte{eapTypeAKAPrime}) {
 		t.Fatalf("type 23 downgrade response = %#v, want legacy Nak selecting type 50", response)
 	}
+	biddingClient, err := newAKAClientWithMethod(testSIMIdentity(), &testAKAProvider{}, "aka-prime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bidding, err := marshalAKAAttribute(akaAttrBidding, []byte{0x80, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	biddingRequest, err := marshalEAPPacket(eapPacket{
+		Code:       eapRequest,
+		Identifier: 34,
+		Type:       eapTypeAKA,
+		Data:       append([]byte{akaSubtypeChallenge, 0, 0}, bidding...),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	biddingAction, err := biddingClient.handle(context.Background(), biddingRequest)
+	if err != nil {
+		t.Fatalf("AT_BIDDING downgrade error = %v", err)
+	}
+	biddingResponse, err := parseEAPPacket(biddingAction.Response)
+	if err != nil || biddingResponse.Type != eapTypeAKA || len(biddingResponse.Data) < 3 || biddingResponse.Data[0] != akaSubtypeAuthReject {
+		t.Fatalf("AT_BIDDING downgrade response = %#v parseErr=%v, want EAP-AKA Authentication-Reject", biddingResponse, err)
+	}
 	for index, unsupportedType := range []uint8{254, 255} {
 		unsupportedRequest, _ := marshalEAPPacket(eapPacket{
 			Code:       eapRequest,

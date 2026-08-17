@@ -3,6 +3,8 @@ package ike
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -144,6 +146,185 @@ func TestSessionRelayCloseInterruptsStuckTransportRead(t *testing.T) {
 func (transport *fakeSessionTransport) Close() error {
 	transport.once.Do(func() { close(transport.closed) })
 	return nil
+}
+
+func relayTestCrypto() (negotiatedSuite, ikeKeys, [8]byte, [8]byte) {
+	suite := legacyTestSuite()
+	keys := ikeKeys{
+		SKai: bytes.Repeat([]byte{0x11}, 20),
+		SKar: bytes.Repeat([]byte{0x12}, 20),
+		SKei: bytes.Repeat([]byte{0x13}, 16),
+		SKer: bytes.Repeat([]byte{0x14}, 16),
+	}
+	return suite, keys, [8]byte{1}, [8]byte{2}
+}
+
+func relayEncryptedRequest(t *testing.T, suite negotiatedSuite, keys ikeKeys, spii, spir [8]byte, exchange uint8, messageID uint32, payloads []payload) []byte {
+	t.Helper()
+	packet, err := encryptPayloads(ikeHeader{
+		InitiatorSPI: spii,
+		ResponderSPI: spir,
+		Exchange:     exchange,
+		MessageID:    messageID,
+	}, payloads, suite, keys.SKer, keys.SKar, bytes.NewReader(bytes.Repeat([]byte{0x44}, 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packet
+}
+
+func relaySentResponse(t *testing.T, transport *fakeSessionTransport, suite negotiatedSuite, keys ikeKeys) (ikeHeader, []payload) {
+	t.Helper()
+	select {
+	case response := <-transport.sent:
+		if !response.ike {
+			t.Fatal("IKE response was sent as ESP")
+		}
+		header, payloads, err := decryptPayloads(response.data, suite, keys.SKei, keys.SKai)
+		if err != nil {
+			t.Fatalf("decrypt response: %v", err)
+		}
+		return header, payloads
+	case <-time.After(time.Second):
+		t.Fatal("relay did not send IKE response")
+		return ikeHeader{}, nil
+	}
+}
+
+func TestSessionRelayAnswersCreateChildSAWithoutTearingDown(t *testing.T) {
+	transport := newFakeSessionTransport()
+	suite, keys, spii, spir := relayTestCrypto()
+	relay := newSessionRelay(transport, suite, keys, spii, spir, 9, true, time.Hour)
+	defer relay.Close()
+
+	transport.incoming <- fakeSessionPacket{
+		ike:  true,
+		data: relayEncryptedRequest(t, suite, keys, spii, spir, exchangeCreateChildSA, 10, nil),
+	}
+	header, payloads := relaySentResponse(t, transport, suite, keys)
+	if header.Exchange != exchangeCreateChildSA || header.MessageID != 10 || header.Flags != flagInitiator|flagResponse {
+		t.Fatalf("CREATE_CHILD_SA response header = %#v", header)
+	}
+	notify, err := onePayload(payloads, payloadNotify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind, data, err := parseNotify(notify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != notifyNoAdditionalSAs || len(data) != 0 {
+		t.Fatalf("CREATE_CHILD_SA response notify = %d/%x, want NO_ADDITIONAL_SAS", kind, data)
+	}
+	select {
+	case <-relay.done:
+		t.Fatal("unsupported CREATE_CHILD_SA tore down the relay")
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestSessionRelayDeletesIKESAOnlyAfterSendingResponse(t *testing.T) {
+	transport := newFakeSessionTransport()
+	suite, keys, spii, spir := relayTestCrypto()
+	relay := newSessionRelay(transport, suite, keys, spii, spir, 9, true, time.Hour)
+	defer relay.Close()
+	transport.incoming <- fakeSessionPacket{
+		ike:  true,
+		data: relayEncryptedRequest(t, suite, keys, spii, spir, exchangeInformational, 11, []payload{{Type: payloadDelete, Body: []byte{protocolIKE, 0, 0, 0}}}),
+	}
+	header, payloads := relaySentResponse(t, transport, suite, keys)
+	if header.MessageID != 11 || len(payloads) != 0 {
+		t.Fatalf("IKE DELETE response = header:%#v payloads:%#v", header, payloads)
+	}
+	select {
+	case <-relay.done:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not terminate after peer IKE DELETE")
+	}
+	if !errors.Is(relay.terminalError(), errPeerDeletedIKESA) {
+		t.Fatalf("terminal error = %v, want errPeerDeletedIKESA", relay.terminalError())
+	}
+}
+
+func TestSessionRelayDeletesChildSAWithOurSPI(t *testing.T) {
+	transport := newFakeSessionTransport()
+	suite, keys, spii, spir := relayTestCrypto()
+	const childInboundSPI = uint32(0x11223344)
+	const childOutboundSPI = uint32(0x55667788)
+	relay := newSessionRelay(transport, suite, keys, spii, spir, 9, true, time.Hour, childInboundSPI, childOutboundSPI)
+	defer relay.Close()
+	requestBody := []byte{protocolESP, 4, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd}
+	transport.incoming <- fakeSessionPacket{
+		ike:  true,
+		data: relayEncryptedRequest(t, suite, keys, spii, spir, exchangeInformational, 12, []payload{{Type: payloadDelete, Body: requestBody}}),
+	}
+	_, payloads := relaySentResponse(t, transport, suite, keys)
+	deletePayload, err := onePayload(payloads, payloadDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(deletePayload.Body[:4], []byte{protocolESP, 4, 0, 1}) || binary.BigEndian.Uint32(deletePayload.Body[4:8]) != childInboundSPI {
+		t.Fatalf("ESP DELETE response body = %x, want our SPI %08x", deletePayload.Body, childInboundSPI)
+	}
+	select {
+	case <-relay.done:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not terminate after peer CHILD_SA DELETE")
+	}
+	if !errors.Is(relay.terminalError(), errPeerDeletedChildSA) {
+		t.Fatalf("terminal error = %v, want errPeerDeletedChildSA", relay.terminalError())
+	}
+}
+
+func TestSessionRelayReplaysCachedResponseForPeerRetransmission(t *testing.T) {
+	transport := newFakeSessionTransport()
+	suite, keys, spii, spir := relayTestCrypto()
+	relay := newSessionRelay(transport, suite, keys, spii, spir, 9, true, time.Hour)
+	defer relay.Close()
+	request := relayEncryptedRequest(t, suite, keys, spii, spir, exchangeInformational, 13, nil)
+	transport.incoming <- fakeSessionPacket{ike: true, data: request}
+	first, _ := relaySentRawResponse(t, transport)
+	transport.incoming <- fakeSessionPacket{ike: true, data: request}
+	second, _ := relaySentRawResponse(t, transport)
+	if !bytes.Equal(first, second) {
+		t.Fatalf("replayed response differs: first=%x second=%x", first, second)
+	}
+	select {
+	case <-relay.done:
+		t.Fatal("DPD retransmission tore down the relay")
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func relaySentRawResponse(t *testing.T, transport *fakeSessionTransport) ([]byte, bool) {
+	t.Helper()
+	select {
+	case response := <-transport.sent:
+		return response.data, response.ike
+	case <-time.After(time.Second):
+		t.Fatal("relay did not send cached response")
+		return nil, false
+	}
+}
+
+func TestSessionRelayAnswersInformationalNotifyAndStaysAlive(t *testing.T) {
+	transport := newFakeSessionTransport()
+	suite, keys, spii, spir := relayTestCrypto()
+	relay := newSessionRelay(transport, suite, keys, spii, spir, 9, true, time.Hour)
+	defer relay.Close()
+	transport.incoming <- fakeSessionPacket{
+		ike:  true,
+		data: relayEncryptedRequest(t, suite, keys, spii, spir, exchangeInformational, 14, []payload{makeNotify(notifyNATSource, bytes.Repeat([]byte{0x01}, 20))}),
+	}
+	header, payloads := relaySentResponse(t, transport, suite, keys)
+	if header.MessageID != 14 || len(payloads) != 0 {
+		t.Fatalf("NOTIFY response = header:%#v payloads:%#v", header, payloads)
+	}
+	select {
+	case <-relay.done:
+		t.Fatal("INFORMATIONAL NOTIFY tore down the relay")
+	case <-time.After(30 * time.Millisecond):
+	}
 }
 
 func TestSessionRelayDemuxesESPAndAnswersEncryptedDPD(t *testing.T) {

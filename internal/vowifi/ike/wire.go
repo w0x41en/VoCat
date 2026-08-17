@@ -14,6 +14,7 @@ const (
 
 	exchangeIKEInit       = 34
 	exchangeIKEAuth       = 35
+	exchangeCreateChildSA = 36
 	exchangeInformational = 37
 
 	flagInitiator = 0x08
@@ -69,6 +70,7 @@ const (
 	notifyInvalidKE       = 17
 	notifyNoProposal      = 14
 	notifyInvalidSyntax   = 7
+	notifyNoAdditionalSAs = 35
 )
 
 var (

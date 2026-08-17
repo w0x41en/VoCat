@@ -185,6 +185,17 @@ func parseAKAAttributes(encoded []byte) ([]akaAttribute, error) {
 	return result, nil
 }
 
+// akaBiddingPrefersPrime decodes RFC 5448 AT_BIDDING. The D bit is only
+// meaningful in an EAP-AKA (type 23) challenge; an explicitly selected AKA
+// client keeps its choice and does not abort merely because the peer advertises
+// AKA' support.
+func akaBiddingPrefersPrime(attribute akaAttribute) (bool, error) {
+	if attribute.Type != akaAttrBidding || len(attribute.Raw) != 4 || attribute.Raw[1] != 1 {
+		return false, errors.New("ike: malformed EAP-AKA AT_BIDDING")
+	}
+	return attribute.Raw[2]&0x80 != 0, nil
+}
+
 func traceEAPPacket(direction string, encoded []byte) EAPTraceEvent {
 	event := EAPTraceEvent{
 		Direction:      direction,
@@ -614,6 +625,27 @@ func (client *akaClient) handle(ctx context.Context, encoded []byte) (eapAction,
 		if client.terminalFailure {
 			return eapAction{}, fmt.Errorf("%w: EAP request received after terminal authentication failure", vowifi.ErrEAPAuthenticationRejected)
 		}
+		// An explicitly selected AKA' client must not silently accept an
+		// EAP-AKA challenge that says the peer also prefers AKA'. That is the
+		// RFC 5448 bidding-down condition; answer with an EAP-AKA
+		// Authentication-Reject using the method actually requested by the
+		// responder. An explicitly selected AKA client treats D=1 as advisory.
+		if packet.Type == eapTypeAKA && client.method == eapTypeAKAPrime &&
+			len(packet.Data) >= 3 && packet.Data[0] == akaSubtypeChallenge &&
+			packet.Data[1] == 0 && packet.Data[2] == 0 {
+			if attributes, parseErr := parseAKAAttributes(packet.Data[3:]); parseErr == nil {
+				for _, attribute := range attributes {
+					if attribute.Type != akaAttrBidding {
+						continue
+					}
+					if prefers, biddingErr := akaBiddingPrefersPrime(attribute); biddingErr == nil && prefers {
+						client.terminalFailure = true
+						client.failureExpected = true
+						return akaAuthenticationRejectResponseForType(packet.Identifier, eapTypeAKA)
+					}
+				}
+			}
+		}
 	default:
 		return eapAction{}, fmt.Errorf("ike: unexpected EAP code %d from responder", packet.Code)
 	}
@@ -852,6 +884,13 @@ func (client *akaClient) respondAKAChallenge(
 		case akaAttrKDF, akaAttrKDFInput:
 			if client.method != eapTypeAKAPrime {
 				return eapAction{}, fmt.Errorf("ike: EAP-AKA challenge contains AKA' attribute %d", attribute.Type)
+			}
+		case akaAttrBidding:
+			// AT_BIDDING is legal in EAP-AKA. Validate its fixed wire shape,
+			// but keep D=1 informational when the caller explicitly selected
+			// AKA rather than AKA'.
+			if _, err := akaBiddingPrefersPrime(attribute); err != nil {
+				return eapAction{}, err
 			}
 		default:
 			if attribute.Type < 128 {

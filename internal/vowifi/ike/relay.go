@@ -2,6 +2,7 @@ package ike
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -10,22 +11,27 @@ import (
 )
 
 type sessionRelay struct {
-	transport datagramTransport
-	suite     negotiatedSuite
-	keys      ikeKeys
-	spii      [8]byte
-	spir      [8]byte
-	deleteID  uint32
-	natt      bool
-	keepalive time.Duration
+	transport   datagramTransport
+	suite       negotiatedSuite
+	keys        ikeKeys
+	spii        [8]byte
+	spir        [8]byte
+	deleteID    uint32
+	childInSPI  uint32
+	childOutSPI uint32
+	natt        bool
+	keepalive   time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
 	esp    chan []byte
 
-	mu      sync.Mutex
-	lastErr error
+	mu                   sync.Mutex
+	lastErr              error
+	lastPeerMessageID    uint32
+	lastPeerResponse     []byte
+	hasLastPeerMessageID bool
 }
 
 func newSessionRelay(
@@ -37,6 +43,8 @@ func newSessionRelay(
 	options ...any,
 ) *sessionRelay {
 	deleteMessageID := uint32(0)
+	childInSPI := uint32(0)
+	childOutSPI := uint32(0)
 	natt := false
 	keepalive := 20 * time.Second
 	// Keep the internal constructor source-compatible with both the pre-merge
@@ -54,24 +62,47 @@ func newSessionRelay(
 		}
 		natt, _ = options[1].(bool)
 		keepalive, _ = options[2].(time.Duration)
+	case 5:
+		switch value := options[0].(type) {
+		case uint32:
+			deleteMessageID = value
+		case int:
+			deleteMessageID = uint32(value)
+		}
+		natt, _ = options[1].(bool)
+		keepalive, _ = options[2].(time.Duration)
+		switch value := options[3].(type) {
+		case uint32:
+			childInSPI = value
+		case int:
+			childInSPI = uint32(value)
+		}
+		switch value := options[4].(type) {
+		case uint32:
+			childOutSPI = value
+		case int:
+			childOutSPI = uint32(value)
+		}
 	}
 	if keepalive <= 0 {
 		keepalive = 20 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	relay := &sessionRelay{
-		transport: transport,
-		suite:     suite,
-		keys:      keys,
-		spii:      initiatorSPI,
-		spir:      responderSPI,
-		deleteID:  deleteMessageID,
-		natt:      natt,
-		keepalive: keepalive,
-		ctx:       ctx,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		esp:       make(chan []byte, 64),
+		transport:   transport,
+		suite:       suite,
+		keys:        keys,
+		spii:        initiatorSPI,
+		spir:        responderSPI,
+		deleteID:    deleteMessageID,
+		childInSPI:  childInSPI,
+		childOutSPI: childOutSPI,
+		natt:        natt,
+		keepalive:   keepalive,
+		ctx:         ctx,
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		esp:         make(chan []byte, 64),
 	}
 	go relay.run()
 	return relay
@@ -140,6 +171,16 @@ func (relay *sessionRelay) run() {
 
 var errMismatchedSessionSPIs = errors.New("ike: session packet has mismatched SPIs")
 
+// Peer-requested teardown is a distinct runtime outcome from a local
+// protocol/transport failure. Keep these sentinels stable so the orchestrator
+// and logs can report an ePDG DELETE accurately.
+var (
+	ErrPeerDeletedIKESA   = errors.New("ike: peer deleted IKE SA")
+	ErrPeerDeletedChildSA = errors.New("ike: peer deleted CHILD_SA")
+	errPeerDeletedIKESA   = ErrPeerDeletedIKESA
+	errPeerDeletedChildSA = ErrPeerDeletedChildSA
+)
+
 func (relay *sessionRelay) handleIKE(packet []byte) error {
 	header, _, err := parseIKEPacket(packet)
 	if err != nil {
@@ -151,27 +192,110 @@ func (relay *sessionRelay) handleIKE(packet []byte) error {
 	if header.Flags&flagResponse != 0 {
 		return nil
 	}
-	if header.Exchange != exchangeInformational {
-		return fmt.Errorf("ike: unsupported responder-initiated exchange %d", header.Exchange)
+	if relay.hasLastPeerMessageID && header.MessageID == relay.lastPeerMessageID {
+		// The peer owns an independent message-ID space. Retransmit the exact
+		// encrypted response instead of running the request again.
+		return relay.transport.SendSessionPacket(relay.ctx, relay.lastPeerResponse, true)
 	}
 	decryptedHeader, payloads, err := decryptPayloads(packet, relay.suite, relay.keys.SKer, relay.keys.SKar)
 	if err != nil {
 		return err
 	}
-	if len(payloads) != 0 {
-		return errors.New("ike: responder INFORMATIONAL request is not an empty DPD probe")
+	if header.Exchange == exchangeCreateChildSA {
+		if err := relay.sendPeerResponse(decryptedHeader, []payload{makeNotify(notifyNoAdditionalSAs, nil)}); err != nil {
+			return err
+		}
+		return nil
 	}
+	if header.Exchange != exchangeInformational {
+		// RFC 7296 permits an endpoint to ignore a request it cannot process.
+		// Do not kill a healthy SA just because an ePDG asks for an extension we
+		// do not implement.
+		return nil
+	}
+
+	deleteProtocol, deletePayload := classifyPeerDelete(payloads)
+	var responsePayloads []payload
+	if deleteProtocol == peerDeleteESP {
+		responsePayloads = []payload{{Type: payloadDelete, Body: relay.espDeleteResponseBody(deletePayload)}}
+	}
+	if err := relay.sendPeerResponse(decryptedHeader, responsePayloads); err != nil {
+		return err
+	}
+	switch deleteProtocol {
+	case peerDeleteIKE:
+		return errPeerDeletedIKESA
+	case peerDeleteESP:
+		return errPeerDeletedChildSA
+	default:
+		return nil
+	}
+}
+
+// sendPeerResponse encrypts, sends, and caches one responder response. The
+// cache is populated only after the socket accepted the packet so a
+// retransmission can safely replay the exact bytes.
+func (relay *sessionRelay) sendPeerResponse(header ikeHeader, payloads []payload) error {
 	response, err := encryptPayloads(ikeHeader{
 		InitiatorSPI: relay.spii,
 		ResponderSPI: relay.spir,
-		Exchange:     exchangeInformational,
+		Exchange:     header.Exchange,
 		Flags:        flagInitiator | flagResponse,
-		MessageID:    decryptedHeader.MessageID,
-	}, nil, relay.suite, relay.keys.SKei, relay.keys.SKai, nil)
+		MessageID:    header.MessageID,
+	}, payloads, relay.suite, relay.keys.SKei, relay.keys.SKai, nil)
 	if err != nil {
 		return err
 	}
-	return relay.transport.SendSessionPacket(relay.ctx, response, true)
+	if err := relay.transport.SendSessionPacket(relay.ctx, response, true); err != nil {
+		return err
+	}
+	relay.lastPeerMessageID = header.MessageID
+	relay.lastPeerResponse = append(relay.lastPeerResponse[:0], response...)
+	relay.hasLastPeerMessageID = true
+	return nil
+}
+
+const (
+	peerDeleteNone uint8 = iota
+	peerDeleteIKE        = protocolIKE
+	peerDeleteESP        = protocolESP
+)
+
+// classifyPeerDelete returns only well-formed IKE/ESP DELETE requests. A
+// NOTIFY, an unknown payload, or a malformed DELETE still receives an empty
+// INFORMATIONAL response and leaves the session alive.
+func classifyPeerDelete(payloads []payload) (uint8, payload) {
+	for _, item := range payloads {
+		if item.Type != payloadDelete || len(item.Body) < 4 {
+			continue
+		}
+		protocol := item.Body[0]
+		spiSize := int(item.Body[1])
+		count := int(binary.BigEndian.Uint16(item.Body[2:4]))
+		if protocol == protocolIKE {
+			if spiSize == 0 && count == 0 && len(item.Body) == 4 {
+				return peerDeleteIKE, item
+			}
+			continue
+		}
+		if protocol == protocolESP && spiSize == 4 && count > 0 &&
+			len(item.Body) == 4+spiSize*count {
+			return peerDeleteESP, item
+		}
+	}
+	return peerDeleteNone, payload{}
+}
+
+func (relay *sessionRelay) espDeleteResponseBody(request payload) []byte {
+	spi := relay.childInSPI
+	if spi == 0 && len(request.Body) >= 8 && request.Body[1] == 4 {
+		// Keep source compatibility for older relay callers that did not pass
+		// CHILD_SA SPIs: echo the requested SPI as a safe fallback.
+		spi = binary.BigEndian.Uint32(request.Body[4:8])
+	}
+	body := []byte{protocolESP, 4, 0, 1, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(body[4:], spi)
+	return body
 }
 
 func (relay *sessionRelay) fail(err error) {
