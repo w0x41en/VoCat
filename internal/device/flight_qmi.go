@@ -124,7 +124,7 @@ func openQMIRadioSession(ctx context.Context, controlDevice string) (qmiRadioSes
 	}
 	openContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	lease, err := qmiport.Acquire(openContext, controlDevice)
+	lease, err := qmiport.Acquire(openContext, controlDevice, "radio-dms")
 	if err != nil {
 		return nil, err
 	}

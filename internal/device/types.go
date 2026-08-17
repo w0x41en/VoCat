@@ -24,6 +24,11 @@ var (
 	ErrRadioFlightMode         = errors.New("radio is in flight mode")
 	ErrInvalidNetworkAPN       = errors.New("invalid cellular APN")
 	ErrRegionBlocked           = errors.New("sim card home region is not served")
+	// ErrQMIPortBusy marks work that could not start because a longer-running
+	// operation -- in practice an eSIM install or switch -- owns the QMI
+	// control port. It is a "retry later", not a device fault, so callers must
+	// not record it as the device's last error or fail over to AT.
+	ErrQMIPortBusy = errors.New("QMI control port is busy with another operation")
 	ErrUSSDSessionNotFound     = errors.New("ussd session not found or already closed")
 )
 

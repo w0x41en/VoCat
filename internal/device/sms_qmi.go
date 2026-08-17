@@ -147,7 +147,7 @@ func openQMISMSSession(ctx context.Context, controlDevice string) (qmiSMSSession
 	}
 	openContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	lease, err := qmiport.Acquire(openContext, controlDevice)
+	lease, err := qmiport.Acquire(openContext, controlDevice, "sms-uim-wms")
 	if err != nil {
 		return nil, err
 	}
@@ -330,10 +330,23 @@ func (manager *Manager) openQMISMSSessionLocked(
 	if manager.qmiSMSOpener == nil {
 		return nil, errors.New("QMI UIM/WMS SMS transport is unavailable")
 	}
+	// An eSIM install holds the control port for the whole SGP.22 transaction,
+	// so waiting out the open deadline here would only burn 15 seconds before
+	// failing anyway. Fail fast instead; the caller retries on its next tick.
+	if manager.ESIMOperationInFlight() {
+		return nil, fmt.Errorf("%w: an eSIM operation owns the eUICC", ErrQMIPortBusy)
+	}
 	openContext, cancel := manager.withTimeout(ctx, manager.commandTimeout*5)
 	defer cancel()
 	session, err := manager.qmiSMSOpener(openContext, controlDevice)
 	if err != nil {
+		// The pre-check above races an operation that starts right after it.
+		// qmiport reports who held the gate at the moment this open gave up,
+		// which closes that window without inspecting manager state again.
+		var busy *qmiport.BusyError
+		if errors.As(err, &busy) {
+			return nil, fmt.Errorf("%w: %s", ErrQMIPortBusy, busy.Error())
+		}
 		return nil, fmt.Errorf("open QMI UIM/WMS SMS session: %w", err)
 	}
 	return session, nil
@@ -384,6 +397,12 @@ func (manager *Manager) sendSMSQMILocked(
 	}
 	session, err := manager.openQMISMSSessionLocked(ctx, controlDevice)
 	if err != nil {
+		if errors.Is(err, ErrQMIPortBusy) {
+			// Nothing was submitted and the device is healthy; the operator is
+			// told to retry once the eSIM operation finishes.
+			result.SubmissionStatus = "esim_busy"
+			return result, SMSSubscriberIdentity{}, err
+		}
 		result.SubmissionStatus = "setup_failed"
 		manager.setResult(id, state, nil, err)
 		return result, SMSSubscriberIdentity{}, err
@@ -632,7 +651,10 @@ func isQMIWMSListTagUnsupported(err error, tag qmi.MessageTagType) bool {
 // empty JSON object in loghub, which would hide whether the modem returned
 // INVALID_ARG (0x0030) or CARD_CALL_CONTROL_FAILED (0x0060).
 func qmiErrorLogAttrs(err error) []any {
-	attrs := []any{"error", err}
+	if err == nil {
+		return nil
+	}
+	attrs := []any{"error", err.Error()}
 	if qmiErr := qmi.GetQMIError(err); qmiErr != nil {
 		attrs = append(attrs,
 			"qmi_service", qmiErr.Service,
@@ -690,6 +712,83 @@ func (manager *Manager) clearQMIWMSScanBackoff(controlDevice string) {
 	manager.qmiSMSBackoffMu.Lock()
 	delete(manager.qmiSMSBackoffUntil, controlDevice)
 	manager.qmiSMSBackoffMu.Unlock()
+	manager.clearQMIWMSUnsupportedTagCache(controlDevice)
+}
+
+func (manager *Manager) qmiWMSUnsupportedTagError(
+	controlDevice, iccid string,
+	storage uint8,
+	tag qmi.MessageTagType,
+) (string, bool) {
+	if manager == nil {
+		return "", false
+	}
+	key := qmiSMSListTagCacheKey{
+		controlDevice: strings.TrimSpace(controlDevice),
+		iccid:         strings.TrimSpace(iccid),
+		storage:       storage,
+		tag:           tag,
+	}
+	manager.qmiSMSUnsupportedTagMu.Lock()
+	defer manager.qmiSMSUnsupportedTagMu.Unlock()
+	message, found := manager.qmiSMSUnsupportedTags[key]
+	return message, found
+}
+
+func (manager *Manager) rememberQMIWMSUnsupportedTag(
+	controlDevice, iccid string,
+	storage uint8,
+	tag qmi.MessageTagType,
+	err error,
+) bool {
+	if manager == nil || err == nil {
+		return false
+	}
+	key := qmiSMSListTagCacheKey{
+		controlDevice: strings.TrimSpace(controlDevice),
+		iccid:         strings.TrimSpace(iccid),
+		storage:       storage,
+		tag:           tag,
+	}
+	manager.qmiSMSUnsupportedTagMu.Lock()
+	defer manager.qmiSMSUnsupportedTagMu.Unlock()
+	if manager.qmiSMSUnsupportedTags == nil {
+		manager.qmiSMSUnsupportedTags = make(map[qmiSMSListTagCacheKey]string)
+	}
+	if _, exists := manager.qmiSMSUnsupportedTags[key]; exists {
+		return false
+	}
+	manager.qmiSMSUnsupportedTags[key] = err.Error()
+	return true
+}
+
+func (manager *Manager) invalidateQMIWMSUnsupportedTagsForICCID(controlDevice, iccid string) {
+	if manager == nil {
+		return
+	}
+	controlDevice = strings.TrimSpace(controlDevice)
+	iccid = strings.TrimSpace(iccid)
+	manager.qmiSMSUnsupportedTagMu.Lock()
+	defer manager.qmiSMSUnsupportedTagMu.Unlock()
+	for key := range manager.qmiSMSUnsupportedTags {
+		if key.controlDevice == controlDevice && key.iccid != iccid {
+			delete(manager.qmiSMSUnsupportedTags, key)
+		}
+	}
+}
+
+func (manager *Manager) clearQMIWMSUnsupportedTagCache(controlDevice string) {
+	if manager == nil {
+		return
+	}
+	controlDevice = strings.TrimSpace(controlDevice)
+	manager.qmiSMSUnsupportedTagMu.Lock()
+	defer manager.qmiSMSUnsupportedTagMu.Unlock()
+	for key := range manager.qmiSMSUnsupportedTags {
+		if key.controlDevice == controlDevice {
+			delete(manager.qmiSMSUnsupportedTags, key)
+		}
+	}
 }
 
 func (manager *Manager) markQMIWMSContextPending(deviceID string) {
@@ -730,6 +829,13 @@ type qmiSMSStorage struct {
 	value uint8
 	name  string
 	rank  int
+}
+
+type qmiSMSListTagCacheKey struct {
+	controlDevice string
+	iccid         string
+	storage       uint8
+	tag           qmi.MessageTagType
 }
 
 var qmiSMSStorages = []qmiSMSStorage{
@@ -1077,6 +1183,7 @@ func (manager *Manager) listSMSQMILockedAttempt(
 	if err != nil {
 		return scan, err
 	}
+	manager.invalidateQMIWMSUnsupportedTagsForICCID(controlDevice, scan.Identity.ICCID)
 	if err := manager.validateQMISMSControl(state, controlDevice); err != nil {
 		return scan, err
 	}
@@ -1106,6 +1213,18 @@ func (manager *Manager) listSMSQMILockedAttempt(
 	for _, storage := range qmiSMSStorages {
 		complete := true
 		for _, requestedTag := range qmiSMSListTags {
+			if cachedError, cached := manager.qmiWMSUnsupportedTagError(
+				controlDevice, scan.Identity.ICCID, storage.value, requestedTag,
+			); cached {
+				if requestedTag == qmi.TagTypeMTRead {
+					complete = false
+					lastListErr = fmt.Errorf(
+						"list QMI WMS %s messages with tag %d: %w: cached unsupported: %s",
+						storage.name, requestedTag, errQMIWMSInboundIncomplete, cachedError,
+					)
+				}
+				continue
+			}
 			listContext, cancel := manager.withTimeout(ctx, manager.commandTimeout)
 			entries, listErr := session.ListMessages(listContext, storage.value, requestedTag)
 			cancel()
@@ -1119,14 +1238,18 @@ func (manager *Manager) listSMSQMILockedAttempt(
 			}
 			if listErr != nil {
 				if isQMIWMSListTagUnsupported(listErr, requestedTag) {
-					unsupportedAttrs := []any{
-						"category", "sms", "event", "qmi_wms_list_tag_unsupported",
-						"control_path", controlDevice, "storage", storage.name,
-						"tag", requestedTag,
+					if manager.rememberQMIWMSUnsupportedTag(
+						controlDevice, scan.Identity.ICCID, storage.value, requestedTag, listErr,
+					) {
+						unsupportedAttrs := []any{
+							"category", "sms", "event", "qmi_wms_list_tag_unsupported",
+							"control_path", controlDevice, "storage", storage.name,
+							"tag", requestedTag,
+						}
+						unsupportedAttrs = append(unsupportedAttrs, qmiErrorLogAttrs(listErr)...)
+						manager.logEvent(slog.LevelInfo, "QMI WMS list tag unsupported",
+							unsupportedAttrs...)
 					}
-					unsupportedAttrs = append(unsupportedAttrs, qmiErrorLogAttrs(listErr)...)
-					manager.logEvent(slog.LevelInfo, "QMI WMS list tag unsupported",
-						unsupportedAttrs...)
 					if requestedTag == qmi.TagTypeMTRead {
 						// MT-read is the only tag that lists inbound messages the
 						// modem has already flagged as read, so losing it leaves a

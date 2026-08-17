@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -866,6 +867,34 @@ func persistVoWiFiReceivedSMS(
 	if message.Concat != nil && message.Concat.Total > 0 {
 		partsTotal = message.Concat.Total
 	}
+	timestamp := message.Timestamp
+	if message.ServiceCenterTimestamp != nil && !message.ServiceCenterTimestamp.IsZero() {
+		// Keep display and ordering on the same clock as cellular ingest. The
+		// local receipt time remains in extra_json.received_at for diagnostics.
+		timestamp = message.ServiceCenterTimestamp.UTC()
+	}
+	dedupKey := ""
+	if message.Concat == nil || message.Concat.Total <= 1 {
+		rawTPDU, decodeErr := hex.DecodeString(strings.TrimSpace(message.RawTPDU))
+		if decodeErr == nil {
+			decoded, smsDecodeErr := device.DecodeSMSDeliverTPDU(rawTPDU)
+			if smsDecodeErr == nil {
+				serviceCenterTimestamp := message.ServiceCenterTimestamp
+				if serviceCenterTimestamp == nil {
+					serviceCenterTimestamp = decoded.ServiceCenterTimestamp
+				}
+				peer := strings.TrimSpace(decoded.From)
+				if peer == "" {
+					peer = strings.TrimSpace(message.From)
+				}
+				dedupKey = store.SMSInboundDedupKey(
+					peer,
+					serviceCenterTimestamp,
+					decoded.RawUserData,
+				)
+			}
+		}
+	}
 	// A service centre that is not satisfied with the delivery report redelivers
 	// the same SMS-DELIVER for many minutes, each time in a fresh SIP
 	// transaction. Addressing a single-segment message by its Call-ID therefore
@@ -891,11 +920,12 @@ func persistVoWiFiReceivedSMS(
 		Peer:       message.From,
 		Direction:  "inbound",
 		Body:       message.Text,
-		Timestamp:  message.Timestamp,
+		Timestamp:  timestamp,
 		Status:     "received",
 		Source:     "ims",
 		PartsTotal: partsTotal,
 		Read:       false,
+		DedupKey:   dedupKey,
 		Extra:      extra,
 	})
 	return err

@@ -828,6 +828,91 @@ func TestSMSPersistenceAndDerivedThreads(t *testing.T) {
 	}
 }
 
+func TestSMSReadStateSurvivesRetryAndCrossTransportDedup(t *testing.T) {
+	ctx := context.Background()
+	database := openTestStore(t, ":memory:")
+	mustSaveDevice(t, database, "wwan0", "OpenStick")
+	const (
+		imei = "867394042309830"
+		imsi = "515661000061889"
+		peer = "+639171234567"
+	)
+	scts := time.Date(2026, 8, 17, 3, 4, 5, 0, time.UTC)
+	key := SMSInboundDedupKey(peer, &scts, "41424344")
+	if key == "" {
+		t.Fatal("SMSInboundDedupKey returned empty key")
+	}
+	first, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: "ims:first", DeviceID: "wwan0", ModemIMEI: imei, IMSI: imsi,
+		Peer: peer, Direction: "inbound", Body: "ABC", Timestamp: scts,
+		Source: "ims", DedupKey: key,
+	})
+	if err != nil {
+		t.Fatalf("save first IMS message: %v", err)
+	}
+	if err := database.MarkSMSRead(ctx, first.ID); err != nil {
+		t.Fatalf("MarkSMSRead: %v", err)
+	}
+	retry, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: first.MessageID, DeviceID: "wwan0", ModemIMEI: imei, IMSI: imsi,
+		Peer: peer, Direction: "inbound", Body: "ABC", Timestamp: scts,
+		Source: "ims", DedupKey: key,
+	})
+	if err != nil {
+		t.Fatalf("save read retry: %v", err)
+	}
+	if retry.ID != first.ID || !retry.Read {
+		t.Fatalf("read retry = %#v, want same id and read=true", retry)
+	}
+
+	cellular, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: "cellular:copy", DeviceID: "wwan0", ModemIMEI: imei, IMSI: imsi,
+		Peer: peer, Direction: "inbound", Body: "ABC", Timestamp: scts.Add(time.Minute),
+		Source: "cellular_qmi", DedupKey: key,
+	})
+	if err != nil {
+		t.Fatalf("save cellular copy: %v", err)
+	}
+	if cellular.ID != first.ID || cellular.Source != "ims" {
+		t.Fatalf("cross-transport copy = %#v, want original IMS row", cellular)
+	}
+
+	secondKey := SMSInboundDedupKey(peer, &scts, "41424345")
+	if secondKey == key {
+		t.Fatal("different TP-UD values collided")
+	}
+	second, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: "cellular:first", DeviceID: "wwan0", ModemIMEI: imei, IMSI: imsi,
+		Peer: peer, Direction: "inbound", Body: "ABD", Timestamp: scts,
+		Source: "cellular_at", DedupKey: secondKey,
+	})
+	if err != nil {
+		t.Fatalf("save second cellular message: %v", err)
+	}
+	if second.Source != "cellular_at" {
+		t.Fatalf("second message source = %q, want cellular_at", second.Source)
+	}
+	secondIMS, err := database.SaveSMSMessage(ctx, SMSMessage{
+		MessageID: "ims:second", DeviceID: "wwan0", ModemIMEI: imei, IMSI: imsi,
+		Peer: peer, Direction: "received", Body: "ABD", Timestamp: scts.Add(time.Minute),
+		Source: "ims", DedupKey: secondKey,
+	})
+	if err != nil {
+		t.Fatalf("save second IMS copy: %v", err)
+	}
+	if secondIMS.ID != second.ID || secondIMS.Source != "cellular_at" {
+		t.Fatalf("reverse cross-transport copy = %#v, want original cellular row", secondIMS)
+	}
+
+	messages, err := database.ListSMSMessages(ctx, SMSFilter{DeviceID: "wwan0", Limit: 100})
+	if err != nil {
+		t.Fatalf("list deduplicated messages: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("deduplicated message count = %d, want 2", len(messages))
+	}
+}
+
 func TestSMSHistoryFollowsModemIMEIAfterDeviceIDRename(t *testing.T) {
 	ctx := context.Background()
 	database := openTestStore(t, ":memory:")

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -465,5 +466,76 @@ func TestVoWiFiReceivedSMSCollapsesServiceCentreRedeliveries(t *testing.T) {
 	}
 	if len(messages) != 2 {
 		t.Fatalf("stored %d rows for two distinct deliveries, want 2", len(messages))
+	}
+}
+
+func TestVoWiFiReceivedSMSSavesServiceCentreTimestampAndKeepsReceiptTime(t *testing.T) {
+	database := newRegionTestStore(t)
+	deviceConfig := store.Device{ID: "wwan0", Name: "410"}
+	receivedAt := time.Date(2026, 8, 17, 10, 30, 0, 0, time.UTC)
+	scts := time.Date(2026, 8, 16, 9, 23, 31, 0, time.UTC)
+	message := ims.ReceivedSMS{
+		DeviceID:               deviceConfig.ID,
+		IMSI:                   "515661000061889",
+		From:                   "VONAGE",
+		Text:                   "your code is 923320",
+		Timestamp:              receivedAt,
+		ServiceCenterTimestamp: &scts,
+		RawTPDU:                "200BD0D6A733782C020008628061903213000441424344",
+		CallID:                 "call-scts",
+	}
+	if err := persistVoWiFiReceivedSMS(
+		context.Background(), database, integration.ATMapper{Store: database}, deviceConfig, message,
+	); err != nil {
+		t.Fatalf("persistVoWiFiReceivedSMS: %v", err)
+	}
+	messages, err := database.ListSMSMessages(context.Background(), store.SMSFilter{DeviceID: deviceConfig.ID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListSMSMessages: %v", err)
+	}
+	if len(messages) != 1 || !messages[0].Timestamp.Equal(scts) {
+		t.Fatalf("stored IMS timestamp = %#v, want SCTS %v", messages, scts)
+	}
+	var extra map[string]any
+	if err := json.Unmarshal(messages[0].Extra, &extra); err != nil {
+		t.Fatalf("decode stored extra: %v", err)
+	}
+	receivedAtText, ok := extra["received_at"].(string)
+	if !ok {
+		t.Fatalf("received_at extra = %#v", extra["received_at"])
+	}
+	storedReceivedAt, err := time.Parse(time.RFC3339Nano, receivedAtText)
+	if err != nil || !storedReceivedAt.Equal(receivedAt) {
+		t.Fatalf("stored received_at = %q/%v, want %v", receivedAtText, err, receivedAt)
+	}
+
+	fallbackAt := receivedAt.Add(time.Minute)
+	fallback := message
+	fallback.CallID = "call-fallback"
+	fallback.Timestamp = fallbackAt
+	fallback.ServiceCenterTimestamp = nil
+	fallback.RawTPDU = "200BD0D6A733782C020008628061904230000441424344"
+	if err := persistVoWiFiReceivedSMS(
+		context.Background(), database, integration.ATMapper{Store: database}, deviceConfig, fallback,
+	); err != nil {
+		t.Fatalf("persist fallback IMS SMS: %v", err)
+	}
+	messages, err = database.ListSMSMessages(context.Background(), store.SMSFilter{DeviceID: deviceConfig.ID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListSMSMessages after fallback: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("stored message count after fallback = %d, want 2", len(messages))
+	}
+	for _, stored := range messages {
+		if stored.MessageID == "" {
+			continue
+		}
+		var rowExtra map[string]any
+		if json.Unmarshal(stored.Extra, &rowExtra) == nil {
+			if rowExtra["call_id"] == "call-fallback" && !stored.Timestamp.Equal(fallbackAt) {
+				t.Fatalf("nil SCTS fallback timestamp = %v, want %v", stored.Timestamp, fallbackAt)
+			}
+		}
 	}
 }

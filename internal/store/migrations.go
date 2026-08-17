@@ -331,6 +331,42 @@ func migrationStatements(version int) []string {
 		// this branch. Such databases can report user_version=18 while still
 		// lacking the columns above, so keep a final additive repair migration.
 		return deviceCarrierProfileMigrationStatements()
+	case 20:
+		return []string{
+			`CREATE TABLE IF NOT EXISTS sms_messages (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				message_id TEXT NOT NULL DEFAULT '',
+				device_id TEXT NOT NULL,
+				modem_imei TEXT NOT NULL DEFAULT '',
+				imsi TEXT NOT NULL DEFAULT '',
+				peer TEXT NOT NULL,
+				direction TEXT NOT NULL,
+				body TEXT NOT NULL DEFAULT '',
+				message_time INTEGER NOT NULL,
+				status TEXT NOT NULL DEFAULT '',
+				source TEXT NOT NULL DEFAULT '',
+				parts_total INTEGER NOT NULL DEFAULT 1 CHECK (parts_total > 0),
+				delivery_state TEXT NOT NULL DEFAULT '',
+				is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+				extra_json TEXT NOT NULL DEFAULT '{}',
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL
+			)`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS sms_messages_external_id_idx
+				ON sms_messages(device_id, message_id)
+				WHERE message_id <> ''`,
+			`CREATE INDEX IF NOT EXISTS sms_messages_thread_idx
+				ON sms_messages(device_id, imsi, peer, message_time DESC, id DESC)`,
+			`CREATE INDEX IF NOT EXISTS sms_messages_time_idx
+				ON sms_messages(message_time DESC)`,
+			`ALTER TABLE sms_messages
+				ADD COLUMN modem_imei TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE sms_messages
+				ADD COLUMN dedup_key TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS sms_messages_dedup_idx
+				ON sms_messages(modem_imei, imsi, dedup_key)
+				WHERE dedup_key <> ''`,
+		}
 	default:
 		return nil
 	}

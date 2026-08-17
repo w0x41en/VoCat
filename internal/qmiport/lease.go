@@ -9,7 +9,35 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
+
+// BusyError reports that the gate was still held by another QMI user when the
+// caller's context expired. An eSIM install holds one control port for the
+// whole SGP.22 transaction (ES9+ round trips plus LoadBoundProfilePackage), so
+// short-deadline users -- the SMS sync loop, VoWiFi AKA -- must be able to tell
+// "another operation owns the card" apart from "the modem stopped answering".
+// Unwrap returns the caller's own context error so existing
+// context.DeadlineExceeded / context.Canceled checks keep working.
+type BusyError struct {
+	Path    string
+	Holder  string
+	HeldFor time.Duration
+	Err     error
+}
+
+func (busy *BusyError) Error() string {
+	holder := busy.Holder
+	if holder == "" {
+		holder = "another QMI operation"
+	}
+	return fmt.Sprintf(
+		"QMI control port %s is busy: held by %s for %s: %v",
+		busy.Path, holder, busy.HeldFor.Truncate(time.Millisecond), busy.Err,
+	)
+}
+
+func (busy *BusyError) Unwrap() error { return busy.Err }
 
 type portHandle interface {
 	Close() error
@@ -23,6 +51,36 @@ type entry struct {
 
 	keeperMu sync.Mutex
 	keeper   portHandle
+
+	// holderMu guards the current owner's label. The gate channel establishes
+	// no happens-before edge for a waiter that gives up, so a losing Acquire
+	// must read this under the mutex rather than off the winner's write.
+	holderMu sync.Mutex
+	holder   string
+	heldFrom time.Time
+}
+
+func (item *entry) claim(holder string) {
+	item.holderMu.Lock()
+	item.holder = holder
+	item.heldFrom = time.Now()
+	item.holderMu.Unlock()
+}
+
+func (item *entry) disown() {
+	item.holderMu.Lock()
+	item.holder = ""
+	item.heldFrom = time.Time{}
+	item.holderMu.Unlock()
+}
+
+func (item *entry) currentHolder() (string, time.Duration) {
+	item.holderMu.Lock()
+	defer item.holderMu.Unlock()
+	if item.heldFrom.IsZero() {
+		return item.holder, 0
+	}
+	return item.holder, time.Since(item.heldFrom)
 }
 
 type coordinator struct {
@@ -56,11 +114,14 @@ func openPort(path string) (portHandle, error) {
 // Acquire keeps path open for the process lifetime and grants exclusive QMI
 // access until the returned lease is released. A modem reset replaces the
 // device node; ensureKeeper detects that inode change and rearms the keepalive.
-func Acquire(ctx context.Context, path string) (*Lease, error) {
-	return processCoordinator.acquire(ctx, path)
+// holder names the caller ("esim-uim", "sms-wms", ...) and is reported back to
+// whoever times out waiting for the gate; it is a log/diagnostic label only and
+// callers must never branch on its value.
+func Acquire(ctx context.Context, path, holder string) (*Lease, error) {
+	return processCoordinator.acquire(ctx, path, holder)
 }
 
-func (coordinator *coordinator) acquire(ctx context.Context, path string) (*Lease, error) {
+func (coordinator *coordinator) acquire(ctx context.Context, path, holder string) (*Lease, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -79,10 +140,18 @@ func (coordinator *coordinator) acquire(ctx context.Context, path string) (*Leas
 
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		currentHolder, heldFor := item.currentHolder()
+		return nil, &BusyError{
+			Path:    path,
+			Holder:  currentHolder,
+			HeldFor: heldFor,
+			Err:     ctx.Err(),
+		}
 	case <-item.gate:
 	}
+	item.claim(holder)
 	if err := coordinator.ensureKeeper(path, item); err != nil {
+		item.disown()
 		item.gate <- struct{}{}
 		return nil, fmt.Errorf("keep QMI control port %s open: %w", path, err)
 	}
@@ -119,6 +188,9 @@ func (lease *Lease) Release() {
 		return
 	}
 	lease.once.Do(func() {
+		// Clear the owner label before handing the token on, so the next
+		// waiter to time out cannot report a holder that already finished.
+		lease.entry.disown()
 		lease.entry.gate <- struct{}{}
 	})
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/w0x41en/quectel-qmi-go/pkg/qmi"
 
 	"vocat/internal/modem"
+	"vocat/internal/qmiport"
 )
 
 type fakeQMISMSListKey struct {
@@ -265,6 +266,85 @@ func TestQMIWMSUnsupportedListTagClassification(t *testing.T) {
 	}
 }
 
+func TestQMIErrorLogAttrsUsesReadableErrorText(t *testing.T) {
+	err := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		Result:    1,
+		ErrorCode: qmi.QMIErrInvalidArg,
+	}
+	attrs := qmiErrorLogAttrs(err)
+	if len(attrs) < 2 {
+		t.Fatalf("qmiErrorLogAttrs() = %#v", attrs)
+	}
+	text, ok := attrs[1].(string)
+	if !ok || text == "" || text == "{}" {
+		t.Fatalf("qmi error attribute = %#v, want readable string", attrs[1])
+	}
+	if got := qmiErrorLogAttrs(nil); got != nil {
+		t.Fatalf("qmiErrorLogAttrs(nil) = %#v, want nil", got)
+	}
+}
+
+func TestNativeQMIListCachesUnsupportedMOTagsPerSubscriber(t *testing.T) {
+	manager, atOpener, id := newStartedNativeSMSManager(t)
+	unsupportedMO := &qmi.QMIError{
+		Service:   qmi.ServiceWMS,
+		MessageID: qmi.WMSListMessages,
+		Result:    1,
+		ErrorCode: qmi.QMIErrInvalidArg,
+	}
+	session := &fakeQMISMSSession{
+		iccid: "8986001234567890123",
+		imsi:  "515031234567890",
+		listErrs: map[fakeQMISMSListKey]error{
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMONotSent}: unsupportedMO,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMONotSent}:  unsupportedMO,
+			{storage: qmiSMSStorageUIM, tag: qmi.TagTypeMOSent}:    unsupportedMO,
+			{storage: qmiSMSStorageNV, tag: qmi.TagTypeMOSent}:     unsupportedMO,
+		},
+	}
+	manager.qmiSMSOpener = func(context.Context, string) (qmiSMSSession, error) {
+		return session, nil
+	}
+	first, err := manager.ListSMSBoundSubscriber(context.Background(), id)
+	if err != nil || !reflect.DeepEqual(first.Storages, []string{"SM", "ME"}) {
+		t.Fatalf("first cached scan = %#v/%v", first, err)
+	}
+	second, err := manager.ListSMSBoundSubscriber(context.Background(), id)
+	if err != nil || !reflect.DeepEqual(second.Storages, []string{"SM", "ME"}) {
+		t.Fatalf("second cached scan = %#v/%v", second, err)
+	}
+	listCalls := 0
+	for _, call := range session.calls {
+		if strings.HasPrefix(call, "list-") {
+			listCalls++
+		}
+	}
+	if listCalls != 12 {
+		t.Fatalf("list calls after cached scan = %d, want 12 (8 + 4)", listCalls)
+	}
+
+	// A new ICCID gets a fresh capability probe instead of inheriting the old
+	// modem profile's unsupported-tag assumptions.
+	session.iccid = "8986001234567890124"
+	if _, err := manager.ListSMSBoundSubscriber(context.Background(), id); err != nil {
+		t.Fatalf("scan after ICCID change: %v", err)
+	}
+	listCalls = 0
+	for _, call := range session.calls {
+		if strings.HasPrefix(call, "list-") {
+			listCalls++
+		}
+	}
+	if listCalls != 20 {
+		t.Fatalf("list calls after ICCID change = %d, want 20", listCalls)
+	}
+	if atOpener.openCount != 0 {
+		t.Fatalf("unexpected AT fallback opens = %d", atOpener.openCount)
+	}
+}
+
 func TestQMIWMSNVFallbackRoutes(t *testing.T) {
 	routes := []qmi.WMSRoute{
 		{MessageType: qmi.WMSMessageTypePointToPoint, MessageClass: qmi.WMSMessageClass0, StorageType: qmi.WMSStorageTypeNone, ReceiptAction: qmi.WMSReceiptActionTransferOnly},
@@ -386,6 +466,71 @@ func TestNativeQMIUnboundSendAlsoUsesLiveIdentity(t *testing.T) {
 	}
 	if atOpener.openCount != 0 {
 		t.Fatalf("AT opener used %d times", atOpener.openCount)
+	}
+}
+
+// An eSIM install owns the QMI control port for the whole SGP.22 transaction.
+// SMS work that collides with it is deferred, not failed: no device-level
+// error is recorded, and the AT transport is not used as a fallback because it
+// drives the same modem stack the install is talking to.
+func TestNativeQMISMSDefersWhileESIMOperationHoldsPort(t *testing.T) {
+	manager, atOpener, id := newStartedNativeSMSManager(t)
+	const marker = "previous unrelated failure"
+	manager.mu.Lock()
+	manager.devices[id].lastError = marker
+	manager.mu.Unlock()
+
+	qmiOpenCount := 0
+	manager.qmiSMSOpener = func(context.Context, string) (qmiSMSSession, error) {
+		qmiOpenCount++
+		return nil, &qmiport.BusyError{
+			Path:    "/dev/wwan0qmi0",
+			Holder:  "esim-uim",
+			HeldFor: 90 * time.Second,
+			Err:     context.DeadlineExceeded,
+		}
+	}
+	assertDeferred := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrQMIPortBusy) {
+			t.Fatalf("%s error = %v, want ErrQMIPortBusy", what, err)
+		}
+		manager.mu.RLock()
+		lastError := manager.devices[id].lastError
+		manager.mu.RUnlock()
+		if lastError != marker {
+			t.Fatalf("%s recorded device error %q", what, lastError)
+		}
+		if atOpener.openCount != 0 {
+			t.Fatalf("%s fell back to AT (%d opens)", what, atOpener.openCount)
+		}
+	}
+
+	_, err := manager.ListSMS(context.Background(), id)
+	assertDeferred(t, "ListSMS", err)
+
+	_, err = manager.ListSMSBoundSubscriber(context.Background(), id)
+	assertDeferred(t, "ListSMSBoundSubscriber", err)
+
+	result, err := manager.SendSMS(context.Background(), id, "+12345", "HELLO")
+	assertDeferred(t, "SendSMS", err)
+	if result.AcceptedByModem || result.SubmissionStatus != "esim_busy" {
+		t.Fatalf("SendSMS result = %#v", result)
+	}
+
+	// While the eSIM lock is held the transport is not opened at all: waiting
+	// out the open deadline could only end in the same busy error.
+	opensBeforeLock := qmiOpenCount
+	manager.lockESIM()
+	_, err = manager.ListSMSBoundSubscriber(context.Background(), id)
+	manager.unlockESIM()
+	assertDeferred(t, "ListSMSBoundSubscriber under eSIM lock", err)
+	if qmiOpenCount != opensBeforeLock {
+		t.Fatalf("QMI transport opened %d times while an eSIM operation held the card",
+			qmiOpenCount-opensBeforeLock)
+	}
+	if manager.ESIMOperationInFlight() {
+		t.Fatal("eSIM busy flag survived unlockESIM")
 	}
 }
 
@@ -788,6 +933,35 @@ func TestNativeQMIListFallsBackToATWhenMTReadTagIsUnsupported(t *testing.T) {
 	if scan.Identity.IMSI != "515031234567890" {
 		t.Fatalf("fallback lost the QMI subscriber identity: %#v", scan.Identity)
 	}
+
+	// The second pass must use the negative cache for MT-read, but it must
+	// remain incomplete and take the same AT fallback. Caching an unsupported
+	// tag must never turn a blind spot into a falsely complete QMI scan.
+	atClient := atOpener.client.(*transcriptClient)
+	atClient.steps = append(atClient.steps,
+		clientStep{command: "AT+CMGF=0", response: okResponse()},
+		clientStep{command: `AT+CPMS="SM"`, response: okResponse()},
+		clientStep{command: "AT+CMGL=4", response: okResponse("+CMGL: 7,1,,23", readPDU)},
+		clientStep{command: `AT+CPMS="ME"`, response: okResponse()},
+		clientStep{command: "AT+CMGL=4", response: okResponse()},
+	)
+	second, err := manager.ListSMSBoundSubscriber(context.Background(), id)
+	if err != nil || second.Transport != SMSTransportCellularAT || len(second.Messages) != 1 {
+		t.Fatalf("cached MT-read fallback scan = (%#v, %v)", second, err)
+	}
+	listCalls := 0
+	for _, call := range session.calls {
+		if strings.HasPrefix(call, "list-") {
+			listCalls++
+		}
+	}
+	if listCalls != 14 {
+		t.Fatalf("list calls after cached MT-read scan = %d, want 14 (8 + 6)", listCalls)
+	}
+	if atOpener.openCount != 1 {
+		t.Fatalf("cached MT-read tag should reuse the AT fallback session; opens=%d", atOpener.openCount)
+	}
+	atClient.assertDone(t)
 }
 
 func TestNativeQMIListSkipsBrokenUIMWhenNVRouteIsAvailable(t *testing.T) {

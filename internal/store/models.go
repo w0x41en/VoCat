@@ -188,6 +188,7 @@ type SMSMessage struct {
 	PartsTotal    int
 	DeliveryState string
 	Read          bool
+	DedupKey      string
 	Extra         json.RawMessage
 	CreatedAt     time.Time
 	UpdatedAt     time.Time

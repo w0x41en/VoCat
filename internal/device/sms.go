@@ -335,6 +335,12 @@ func (manager *Manager) ListSMS(
 			return nil, err
 		}
 		scan, scanErr := manager.listSMSQMILocked(ctx, state, controlDevice)
+		if errors.Is(scanErr, ErrQMIPortBusy) {
+			// The card is mid-eSIM-transaction. Falling back to AT would poke
+			// the same modem stack, and recording this as the device's last
+			// error would surface a fault the operator cannot act on.
+			return scan.Messages, scanErr
+		}
 		if scanErr != nil && (isQMIWMSContextFailure(scanErr) ||
 			errors.Is(scanErr, errQMIWMSScanSuspended) ||
 			errors.Is(scanErr, errQMIWMSInboundIncomplete)) {
@@ -380,6 +386,11 @@ func (manager *Manager) ListSMSBoundSubscriber(
 			return SMSSubscriberScan{Transport: SMSTransportCellularQMI}, err
 		}
 		scan, scanErr := manager.listSMSQMILocked(ctx, state, controlDevice)
+		if errors.Is(scanErr, ErrQMIPortBusy) {
+			// See ListSMS: an eSIM transaction owns the card, so this scan is
+			// deferred rather than failed.
+			return scan, scanErr
+		}
 		if scanErr != nil && (isQMIWMSContextFailure(scanErr) ||
 			errors.Is(scanErr, errQMIWMSScanSuspended) ||
 			errors.Is(scanErr, errQMIWMSInboundIncomplete)) {

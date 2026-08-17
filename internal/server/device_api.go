@@ -1297,6 +1297,8 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "device_manager_not_started", "device manager is not started")
 	case errors.Is(err, device.ErrNoATPort):
 		writeError(w, http.StatusServiceUnavailable, "at_port_unavailable", "device has no usable AT port")
+	case errors.Is(err, device.ErrESIMModemUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "esim_modem_unavailable", err.Error())
 	case errors.Is(err, device.ErrDataBackendUnavailable):
 		writeError(w, http.StatusNotImplemented, "data_backend_unavailable", err.Error())
 	case errors.Is(err, device.ErrEUICCChannelStuck):
@@ -1333,6 +1335,11 @@ func (s *Server) writeDeviceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "radio_flight_mode", "disable flight mode before starting cellular registration or data")
 	case errors.Is(err, device.ErrSMSSubscriberIdentity):
 		writeError(w, http.StatusServiceUnavailable, "sms_subscriber_identity_unavailable", err.Error())
+	// Must precede the DeadlineExceeded case: a busy-port error unwraps to the
+	// caller's context error, so the generic timeout arm would swallow it.
+	case errors.Is(err, device.ErrQMIPortBusy):
+		writeError(w, http.StatusConflict, "qmi_port_busy",
+			"An eSIM operation is using the SIM right now; retry once it finishes.")
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, modem.ErrCommandTimeout):
 		writeError(w, http.StatusGatewayTimeout, "modem_timeout", "the modem did not answer before the command timeout")
 	case errors.Is(err, context.Canceled):

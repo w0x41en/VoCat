@@ -38,9 +38,17 @@ type subscriberBoundSMSReader interface {
 	) (device.SMSSubscriberScan, error)
 }
 
+// esimBusyReporter lets the sync loop stand down while an eSIM install or
+// switch owns the eUICC, instead of queueing a scan that can only block on the
+// QMI control port until its deadline expires.
+type esimBusyReporter interface {
+	ESIMOperationInFlight() bool
+}
+
 var (
 	_ subscriberBoundSMSSender = (*device.Manager)(nil)
 	_ subscriberBoundSMSReader = (*device.Manager)(nil)
+	_ esimBusyReporter         = (*device.Manager)(nil)
 )
 
 type smsMEProvenance struct {
@@ -741,6 +749,13 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 	if s.devices == nil {
 		return
 	}
+	if busy, ok := s.devices.(esimBusyReporter); ok && busy.ESIMOperationInFlight() {
+		s.logger.Debug(
+			"modem SMS synchronization skipped",
+			"reason", "esim_operation_in_flight",
+		)
+		return
+	}
 	configs, err := s.store.ListDevices(ctx)
 	if err != nil {
 		s.logger.Warn("list devices for SMS synchronization failed", "error", err)
@@ -864,6 +879,14 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 			if message.Direction == device.SMSDirectionSubmitted {
 				direction = "outbound"
 			}
+			dedupKey := ""
+			if direction == "inbound" && (message.Concat == nil || message.Concat.Total <= 1) {
+				dedupKey = store.SMSInboundDedupKey(
+					peer,
+					message.ServiceCenterTimestamp,
+					message.RawUserData,
+				)
+			}
 			messageIDScope := messageIMSI
 			if isPersistentME {
 				// ME is modem-owned. Its durable occurrence ID must survive a
@@ -935,6 +958,7 @@ func (s *Server) syncModemSMS(ctx context.Context, onlyDevice string) {
 				PartsTotal:    concatTotal(message.Concat),
 				DeliveryState: message.DeliveryStatus,
 				Read:          message.StorageStatus == device.SMSStatusReceivedRead,
+				DedupKey:      dedupKey,
 				Extra:         extra,
 			})
 			if saveErr != nil {

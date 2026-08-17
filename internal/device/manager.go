@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vocat/internal/modem"
@@ -29,6 +30,7 @@ type Manager struct {
 	mu                            sync.RWMutex
 	uiccMu                        sync.Mutex // serializes multi-command UICC/APDU transactions
 	esimMu                        sync.Mutex // serializes eSIM card access (list/switch/download)
+	esimBusy                      atomic.Bool
 	esimRecoveryMu                sync.Mutex
 	esimRecoveries                map[string]chan struct{}
 	esimSwitchMu                  sync.RWMutex
@@ -50,6 +52,8 @@ type Manager struct {
 	logger                        *slog.Logger
 	qmiSMSBackoffMu               sync.Mutex
 	qmiSMSBackoffUntil            map[string]time.Time
+	qmiSMSUnsupportedTagMu        sync.Mutex
+	qmiSMSUnsupportedTags         map[qmiSMSListTagCacheKey]string
 	qmiSMSContextMu               sync.Mutex
 	qmiSMSContextPending          map[string]bool
 	nativeQMIRegistrationMu       sync.Mutex
@@ -68,11 +72,27 @@ func (manager *Manager) UnlockUICC() { manager.uiccMu.Unlock() }
 func (manager *Manager) lockESIM() {
 	manager.esimMu.Lock()
 	manager.uiccMu.Lock()
+	manager.esimBusy.Store(true)
 }
 
 func (manager *Manager) unlockESIM() {
+	manager.esimBusy.Store(false)
 	manager.uiccMu.Unlock()
 	manager.esimMu.Unlock()
+}
+
+// ESIMOperationInFlight reports whether a card-touching eSIM operation holds
+// the eUICC (and therefore the QMI control port) right now. It is a fast-skip
+// hint for short-deadline pollers: an install keeps the port for the whole
+// SGP.22 transaction, far longer than their deadlines. The flag is manager-wide
+// rather than per device because esimMu itself is, which is safe here -- these
+// deployments drive a single native modem. Contention that slips through the
+// check anyway is still classified correctly from qmiport.BusyError.
+func (manager *Manager) ESIMOperationInFlight() bool {
+	if manager == nil {
+		return false
+	}
+	return manager.esimBusy.Load()
 }
 
 // ussdSession tracks an open USSD dialog on a device so a follow-up Continue or
@@ -136,6 +156,7 @@ func NewManager(options Options) (*Manager, error) {
 		cardReaders:                   options.CardReaders,
 		logger:                        options.Logger,
 		qmiSMSBackoffUntil:            make(map[string]time.Time),
+		qmiSMSUnsupportedTags:         make(map[qmiSMSListTagCacheKey]string),
 		qmiSMSContextPending:          make(map[string]bool),
 		nativeQMIRegistrationInFlight: make(map[string]struct{}),
 		devices:                       make(map[string]*managedDevice),
@@ -438,7 +459,7 @@ func (manager *Manager) setResult(
 		state.lastError = err.Error()
 		manager.logEvent(slog.LevelWarn, "device operation failed",
 			"category", "device", "event", "operation_failed",
-			"device_id", id, "recovering", state.recovering, "error", err)
+			"device_id", id, "recovering", state.recovering, "error", err.Error())
 	} else {
 		state.lastError = ""
 		if snapshot != nil {

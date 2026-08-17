@@ -53,6 +53,7 @@ func saveSMSMessage(
 	value.ModemIMEI = strings.TrimSpace(value.ModemIMEI)
 	value.Peer = strings.TrimSpace(value.Peer)
 	value.Direction = strings.ToLower(strings.TrimSpace(value.Direction))
+	value.DedupKey = strings.TrimSpace(value.DedupKey)
 	if value.DeviceID == "" {
 		return SMSMessage{}, errors.New("SMS device id is required")
 	}
@@ -265,6 +266,27 @@ func saveSMSMessage(
 		}
 	}
 	if !concatMessage && value.ID == 0 {
+		if isInboundSMSDirection(value.Direction) && value.DedupKey != "" && value.IMSI != "" {
+			existing, found, findErr := findInboundSMSByDedupKey(ctx, executor, value)
+			if findErr != nil {
+				return SMSMessage{}, fmt.Errorf("find duplicate inbound SMS: %w", findErr)
+			}
+			if found {
+				// Keep the first transport/source and durable message id so the
+				// notification cursor does not emit a second event when the same
+				// SMS moves from IMS to cellular (or the reverse).
+				value.ID = existing.ID
+				value.MessageID = existing.MessageID
+				value.Source = existing.Source
+				value.CreatedAt = existing.CreatedAt
+				value.Read = value.Read || existing.Read
+				value.DedupKey = existing.DedupKey
+				if !existing.Timestamp.IsZero() &&
+					(value.Timestamp.IsZero() || existing.Timestamp.Before(value.Timestamp)) {
+					value.Timestamp = existing.Timestamp
+				}
+			}
+		}
 		adopted, found, adoptErr := adoptLegacyStorageSMSMessage(
 			ctx,
 			executor,
@@ -295,13 +317,14 @@ func saveSMSMessage(
 				message_id = ?, device_id = ?, modem_imei = ?, imsi = ?, peer = ?,
 				direction = ?, body = ?, message_time = ?, status = ?,
 				source = ?, parts_total = ?, delivery_state = ?, is_read = ?,
+				dedup_key = CASE WHEN ? <> '' THEN ? ELSE dedup_key END,
 				extra_json = ?, updated_at = ?
 			WHERE id = ?
 		`,
 			value.MessageID, value.DeviceID, value.ModemIMEI, value.IMSI, value.Peer,
 			value.Direction, value.Body, value.Timestamp.Unix(), value.Status,
 			value.Source, value.PartsTotal, value.DeliveryState,
-			boolInt(value.Read), string(extra), value.UpdatedAt.Unix(), value.ID,
+			boolInt(value.Read), value.DedupKey, value.DedupKey, string(extra), value.UpdatedAt.Unix(), value.ID,
 		)
 		if err != nil {
 			return SMSMessage{}, fmt.Errorf("update SMS %d: %w", value.ID, err)
@@ -315,9 +338,9 @@ func saveSMSMessage(
 	result, err := executor.ExecContext(ctx, `
 		INSERT INTO sms_messages (
 			message_id, device_id, modem_imei, imsi, peer, direction, body, message_time,
-			status, source, parts_total, delivery_state, is_read, extra_json,
+			status, source, parts_total, delivery_state, is_read, dedup_key, extra_json,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT DO UPDATE SET
 			device_id = excluded.device_id,
 			modem_imei = CASE
@@ -333,14 +356,15 @@ func saveSMSMessage(
 			source = excluded.source,
 			parts_total = excluded.parts_total,
 			delivery_state = excluded.delivery_state,
-			is_read = excluded.is_read,
+			is_read = MAX(sms_messages.is_read, excluded.is_read),
+			dedup_key = CASE WHEN excluded.dedup_key <> '' THEN excluded.dedup_key ELSE sms_messages.dedup_key END,
 			extra_json = excluded.extra_json,
 			updated_at = excluded.updated_at
 	`,
 		value.MessageID, value.DeviceID, value.ModemIMEI, value.IMSI, value.Peer,
 		value.Direction, value.Body, value.Timestamp.Unix(), value.Status,
 		value.Source, value.PartsTotal, value.DeliveryState,
-		boolInt(value.Read), string(extra), value.CreatedAt.Unix(),
+		boolInt(value.Read), value.DedupKey, string(extra), value.CreatedAt.Unix(),
 		value.UpdatedAt.Unix(),
 	)
 	if err != nil {
@@ -555,6 +579,37 @@ func legacyCellularSourceCandidates(currentSource string) []string {
 		// IMS and any future transports may inspect only their own legacy rows.
 		return []string{currentSource}
 	}
+}
+
+func isInboundSMSDirection(direction string) bool {
+	switch strings.ToLower(strings.TrimSpace(direction)) {
+	case "inbound", "received":
+		return true
+	default:
+		return false
+	}
+}
+
+func findInboundSMSByDedupKey(
+	ctx context.Context,
+	executor contextQueryExecer,
+	value SMSMessage,
+) (SMSMessage, bool, error) {
+	hardwareKey := smsHardwareKey(value.ModemIMEI, value.DeviceID)
+	message, err := scanSMSMessage(executor.QueryRowContext(ctx, smsMessageSelect+` WHERE
+		COALESCE(NULLIF(modem_imei, ''), 'device:' || device_id) = ?
+		AND imsi = ?
+		AND dedup_key = ?
+		AND direction IN ('inbound', 'received')
+	ORDER BY id ASC
+	LIMIT 1`, hardwareKey, value.IMSI, value.DedupKey))
+	if errors.Is(err, ErrNotFound) {
+		return SMSMessage{}, false, nil
+	}
+	if err != nil {
+		return SMSMessage{}, false, err
+	}
+	return message, true, nil
 }
 
 func legacyConcatIdentityMatches(
@@ -1621,7 +1676,7 @@ func (s *Store) ListSMSContacts(ctx context.Context, filter SMSFilter) ([]SMSCon
 const smsMessageSelect = `
 	SELECT id, message_id, device_id, modem_imei, imsi, peer, direction, body,
 		message_time, status, source, parts_total, delivery_state, is_read,
-		extra_json, created_at, updated_at
+		dedup_key, extra_json, created_at, updated_at
 	FROM sms_messages`
 
 func scanSMSMessage(row rowScanner) (SMSMessage, error) {
@@ -1633,7 +1688,7 @@ func scanSMSMessage(row rowScanner) (SMSMessage, error) {
 		&value.ID, &value.MessageID, &value.DeviceID, &value.ModemIMEI, &value.IMSI,
 		&value.Peer, &value.Direction, &value.Body, &messageTime,
 		&value.Status, &value.Source, &value.PartsTotal,
-		&value.DeliveryState, &read, &extra, &createdAt, &updatedAt,
+		&value.DeliveryState, &read, &value.DedupKey, &extra, &createdAt, &updatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SMSMessage{}, ErrNotFound
