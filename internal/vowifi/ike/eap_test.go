@@ -1024,3 +1024,248 @@ func TestEAPAKAUSIMNetworkAuthenticationFailureSendsReject(t *testing.T) {
 		t.Fatalf("failure after Authentication-Reject error = %v", err)
 	}
 }
+
+// The vector is a live capture from Smart Philippines (515/03) on 2026-08-17:
+// its AKA-Challenge carried AT_CHECKCODE 2862b445..., which is SHA-1 over the
+// AKA-Identity round exactly as this client transmits it.  Reproducing the
+// operator's own value proves the hash input, not just the hash.
+func TestEAPAKACheckcodeMatchesSmartCapture(t *testing.T) {
+	const (
+		wireIdentityRequest  = "0101000c170500000a010000"
+		wireIdentityResponse = "02010044170500000e0f003630353135303339323437343832343433406e" +
+			"61692e6570632e6d6e633030332e6d63633531352e336770706e6574776f726b2e6f72670000"
+		wireCheckcode = "2862b44541d2de929a35332ac3c076f7bd43da52"
+	)
+	result := vowifi.AKAResult{
+		RES: bytes.Repeat([]byte{0x91}, 8),
+		CK:  bytes.Repeat([]byte{0x92}, 16),
+		IK:  bytes.Repeat([]byte{0x93}, 16),
+	}
+	provider := &testAKAProvider{result: result}
+	client, err := newAKAClient(vowifi.SIMIdentity{
+		IMSI:    "515039247482443",
+		HomeMCC: "515",
+		HomeMNC: "03",
+	}, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := client.handle(context.Background(), mustHex(t, wireIdentityRequest))
+	if err != nil {
+		t.Fatalf("identity round error = %v", err)
+	}
+	if got := hex.EncodeToString(action.Response); got != wireIdentityResponse {
+		t.Fatalf("identity response = %s, want %s", got, wireIdentityResponse)
+	}
+	if got := hex.EncodeToString(client.checkcode()); got != wireCheckcode {
+		t.Fatalf("checkcode = %s, want %s", got, wireCheckcode)
+	}
+
+	request := testAKAChallengeRequest(t, client, result, 2, mustHex(t, wireCheckcode))
+	action, err = client.handle(context.Background(), request)
+	if err != nil {
+		t.Fatalf("challenge error = %v", err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("SIM authenticate calls = %d", provider.calls)
+	}
+	response, err := parseEAPPacket(action.Response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseAttributes, err := parseAKAAttributes(response.Data[3:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkcode, err := oneAKAAttribute(responseAttributes, akaAttrCheckcode)
+	if err != nil {
+		t.Fatalf("response AT_CHECKCODE: %v", err)
+	}
+	if len(checkcode.Raw) != 24 || checkcode.Raw[1] != 6 ||
+		checkcode.Raw[2] != 0 || checkcode.Raw[3] != 0 {
+		t.Fatalf("AT_CHECKCODE wire encoding = %x", checkcode.Raw)
+	}
+	if got := hex.EncodeToString(checkcode.Raw[4:]); got != wireCheckcode {
+		t.Fatalf("response checkcode = %s, want %s", got, wireCheckcode)
+	}
+	// AT_MAC has to cover the attribute, otherwise the checkcode is unprotected
+	// and buys nothing.
+	keys, err := deriveAKAKeys(client.identity, result.IK, result.CK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseMAC, err := oneAKAAttribute(responseAttributes, akaAttrMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroed := append([]byte(nil), action.Response...)
+	macOffset := 5 + 3 + responseMAC.Offset
+	actualMAC := append([]byte(nil), zeroed[macOffset+4:macOffset+20]...)
+	for index := macOffset + 4; index < macOffset+20; index++ {
+		zeroed[index] = 0
+	}
+	if !bytes.Equal(actualMAC, akaMAC(keys.KAut, zeroed)) {
+		t.Fatal("response AT_MAC does not cover AT_CHECKCODE")
+	}
+}
+
+func TestEAPAKACheckcodeMismatchIsRejectedBeforeSIMAccess(t *testing.T) {
+	result := vowifi.AKAResult{
+		RES: bytes.Repeat([]byte{0x91}, 8),
+		CK:  bytes.Repeat([]byte{0x92}, 16),
+		IK:  bytes.Repeat([]byte{0x93}, 16),
+	}
+	provider := &testAKAProvider{result: result}
+	client, err := newAKAClient(testSIMIdentity(), provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anyID, _ := marshalAKAAttribute(akaAttrAnyIDReq, []byte{0, 0})
+	identityRequest, _ := marshalEAPPacket(eapPacket{
+		Code:       eapRequest,
+		Identifier: 1,
+		Type:       eapTypeAKA,
+		Data:       append([]byte{akaSubtypeIdentity, 0, 0}, anyID...),
+	})
+	if _, err := client.handle(context.Background(), identityRequest); err != nil {
+		t.Fatalf("identity round error = %v", err)
+	}
+	tampered := append([]byte(nil), client.checkcode()...)
+	tampered[0] ^= 0xff
+	request := testAKAChallengeRequest(t, client, result, 2, tampered)
+	action, err := client.handle(context.Background(), request)
+	if err != nil {
+		t.Fatalf("checkcode mismatch error = %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("SIM was accessed on a mismatched checkcode: calls=%d", provider.calls)
+	}
+	response, err := parseEAPPacket(action.Response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Data[0] != akaSubtypeClientError {
+		t.Fatalf("mismatch response subtype = %d, want client error", response.Data[0])
+	}
+}
+
+// Without an AKA-Identity round there is nothing to protect, so the attribute is
+// only mirrored — empty, as RFC 4187 Section 10.13 defines it — when the
+// responder itself sent one.
+func TestEAPAKACheckcodeWithoutIdentityRound(t *testing.T) {
+	result := vowifi.AKAResult{
+		RES: bytes.Repeat([]byte{0x91}, 8),
+		CK:  bytes.Repeat([]byte{0x92}, 16),
+		IK:  bytes.Repeat([]byte{0x93}, 16),
+	}
+	for _, test := range []struct {
+		name             string
+		responder        []byte
+		responderPresent bool
+		wantPresent      bool
+	}{
+		{name: "responder silent", wantPresent: false},
+		{name: "responder empty", responder: nil, responderPresent: true, wantPresent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &testAKAProvider{result: result}
+			client, err := newAKAClient(testSIMIdentity(), provider)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkcode := test.responder
+			if !test.responderPresent {
+				checkcode = nil
+			}
+			request := testAKAChallengeRequestWithOptions(t, client, result, 3, checkcode, test.responderPresent)
+			action, err := client.handle(context.Background(), request)
+			if err != nil {
+				t.Fatalf("challenge error = %v", err)
+			}
+			response, err := parseEAPPacket(action.Response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.Data[0] != akaSubtypeChallenge {
+				t.Fatalf("response subtype = %d", response.Data[0])
+			}
+			attributes, err := parseAKAAttributes(response.Data[3:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			attribute, err := oneAKAAttribute(attributes, akaAttrCheckcode)
+			if test.wantPresent {
+				if err != nil {
+					t.Fatalf("expected mirrored AT_CHECKCODE: %v", err)
+				}
+				if len(attribute.Raw) != 4 {
+					t.Fatalf("mirrored AT_CHECKCODE = %x, want empty", attribute.Raw)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("unexpected AT_CHECKCODE = %x", attribute.Raw)
+			}
+		})
+	}
+}
+
+func testAKAChallengeRequest(
+	t *testing.T,
+	client *akaClient,
+	result vowifi.AKAResult,
+	identifier uint8,
+	checkcode []byte,
+) []byte {
+	t.Helper()
+	return testAKAChallengeRequestWithOptions(t, client, result, identifier, checkcode, true)
+}
+
+func testAKAChallengeRequestWithOptions(
+	t *testing.T,
+	client *akaClient,
+	result vowifi.AKAResult,
+	identifier uint8,
+	checkcode []byte,
+	withCheckcode bool,
+) []byte {
+	t.Helper()
+	keys, err := deriveAKAKeys(client.identity, result.IK, result.CK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	randAttribute, _ := marshalAKAAttribute(akaAttrRAND, append([]byte{0, 0}, bytes.Repeat([]byte{0xa1}, 16)...))
+	autnAttribute, _ := marshalAKAAttribute(akaAttrAUTN, append([]byte{0, 0}, bytes.Repeat([]byte{0xa2}, 16)...))
+	macAttribute, _ := marshalAKAAttribute(akaAttrMAC, make([]byte, 18))
+	data := []byte{akaSubtypeChallenge, 0, 0}
+	data = append(data, randAttribute...)
+	data = append(data, autnAttribute...)
+	if withCheckcode {
+		checkcodeAttribute, err := marshalAKAAttribute(akaAttrCheckcode, append([]byte{0, 0}, checkcode...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, checkcodeAttribute...)
+	}
+	data = append(data, macAttribute...)
+	request, err := marshalEAPPacket(eapPacket{
+		Code:       eapRequest,
+		Identifier: identifier,
+		Type:       eapTypeAKA,
+		Data:       data,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes, err := parseAKAAttributes(data[3:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac, err := oneAKAAttribute(attributes, akaAttrMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	macOffset := 5 + 3 + mac.Offset
+	copy(request[macOffset+4:macOffset+20], akaMAC(keys.KAut, request))
+	return request
+}

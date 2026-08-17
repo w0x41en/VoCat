@@ -51,6 +51,7 @@ const (
 	akaAttrClientError    = 22
 	akaAttrKDFInput       = 23
 	akaAttrKDF            = 24
+	akaAttrCheckcode      = 134
 	akaAttrResultInd      = 135
 	akaAttrBidding        = 136
 
@@ -486,6 +487,20 @@ func permanentAKAIdentityForType(identity vowifi.SIMIdentity, method uint8) ([]b
 	return []byte(fmt.Sprintf("%s%s@nai.epc.mnc%s.mcc%s.3gppnetwork.org", prefix, imsi, mnc, mcc)), nil
 }
 
+// eapFailureStage names how far the EAP-AKA exchange had progressed when the
+// responder gave up, which is what separates "the AAA does not accept this
+// identity" from "the AAA does not accept this AKA result".
+func eapFailureStage(client *akaClient) string {
+	switch {
+	case client.challengeComplete:
+		return "after the AKA challenge (AKA result or subscription rejected)"
+	case client.methodStarted:
+		return "after the AKA identity was supplied but before any challenge (identity or subscription rejected)"
+	default:
+		return "before EAP-AKA started (identity or subscription rejected at first contact)"
+	}
+}
+
 type eapAction struct {
 	Response []byte
 	Success  bool
@@ -513,6 +528,11 @@ type akaClient struct {
 	lastAction        eapAction
 	identityRounds    int
 	identitySeen      map[uint8]bool
+	// identityPackets holds every completed EAP-AKA/Identity round trip exactly
+	// as it went over the wire, request first, which is what RFC 4187
+	// Section 10.13 hashes into AT_CHECKCODE.  The AKA-Identity round carries no
+	// AT_MAC, so this is the only thing that binds it to the challenge.
+	identityPackets []byte
 }
 
 func newAKAClient(identity vowifi.SIMIdentity, provider vowifi.AKAProvider) (*akaClient, error) {
@@ -626,7 +646,7 @@ func (client *akaClient) handle(ctx context.Context, encoded []byte) (eapAction,
 		}
 		action = eapAction{Response: response}
 	case client.method:
-		action, err = client.handleAKARequest(ctx, packet)
+		action, err = client.handleAKARequest(ctx, packet, encoded)
 		if err != nil {
 			return action, err
 		}
@@ -662,7 +682,7 @@ func (client *akaClient) handle(ctx context.Context, encoded []byte) (eapAction,
 	return action, nil
 }
 
-func (client *akaClient) handleAKARequest(ctx context.Context, packet eapPacket) (eapAction, error) {
+func (client *akaClient) handleAKARequest(ctx context.Context, packet eapPacket, encoded []byte) (eapAction, error) {
 	if len(packet.Data) < 3 {
 		return client.clientErrorResponse(packet.Identifier)
 	}
@@ -679,7 +699,7 @@ func (client *akaClient) handleAKARequest(ctx context.Context, packet eapPacket)
 	}
 	switch subtype {
 	case akaSubtypeIdentity:
-		action, err := client.respondAKAIdentity(packet.Identifier, attributes)
+		action, err := client.respondAKAIdentity(packet.Identifier, attributes, encoded)
 		if err != nil {
 			return client.clientErrorResponse(packet.Identifier)
 		}
@@ -704,7 +724,7 @@ func (client *akaClient) handleAKARequest(ctx context.Context, packet eapPacket)
 	}
 }
 
-func (client *akaClient) respondAKAIdentity(identifier uint8, attributes []akaAttribute) (eapAction, error) {
+func (client *akaClient) respondAKAIdentity(identifier uint8, attributes []akaAttribute, encoded []byte) (eapAction, error) {
 	requests := 0
 	requestKind := uint8(0)
 	for _, attribute := range attributes {
@@ -752,7 +772,51 @@ func (client *akaClient) respondAKAIdentity(identifier uint8, attributes []akaAt
 		Type:       client.method,
 		Data:       data,
 	})
-	return eapAction{Response: response}, err
+	if err != nil {
+		return eapAction{}, err
+	}
+	// Only a completed round trip is hashed, and the packets are hashed as they
+	// were transmitted: no delimiters, no re-encoding, padding bytes left alone.
+	// handle() answers retransmissions from its cache without reaching this
+	// point, so a repeated Identifier is never recorded twice.
+	client.identityPackets = append(client.identityPackets, encoded...)
+	client.identityPackets = append(client.identityPackets, response...)
+	return eapAction{Response: response}, nil
+}
+
+// checkcode returns the RFC 4187 Section 10.13 hash over the AKA-Identity round
+// trips, or nil when no identity messages were exchanged, in which case the
+// attribute is sent empty to say exactly that.  EAP-AKA' swaps SHA-1 for
+// SHA-256 (RFC 5448 Section 3.4.3).
+func (client *akaClient) checkcode() []byte {
+	if len(client.identityPackets) == 0 {
+		return nil
+	}
+	if client.method == eapTypeAKAPrime {
+		digest := sha256.Sum256(client.identityPackets)
+		return digest[:]
+	}
+	digest := sha1.Sum(client.identityPackets)
+	return digest[:]
+}
+
+// verifyCheckcode implements the RFC 4187 Section 10.13 rule that a receiver
+// implementing AT_CHECKCODE MUST check it.  A mismatch means the unauthenticated
+// AKA-Identity round was altered in flight, which Section 6.3.1 handles as a
+// client error.
+func (client *akaClient) verifyCheckcode(attribute akaAttribute) error {
+	if len(attribute.Raw) < 4 {
+		return errors.New("ike: malformed AT_CHECKCODE")
+	}
+	received := attribute.Raw[4:]
+	expected := client.checkcode()
+	if !bytes.Equal(received, expected) {
+		return fmt.Errorf(
+			"ike: AT_CHECKCODE mismatch: responder sent %x, peer computed %x over %d bytes of AKA-Identity packets",
+			received, expected, len(client.identityPackets),
+		)
+	}
+	return nil
 }
 
 func (client *akaClient) respondAKAChallenge(
@@ -771,9 +835,20 @@ func (client *akaClient) respondAKAChallenge(
 	if negotiation != nil {
 		return *negotiation, nil
 	}
+	responderCheckcode := false
 	for _, attribute := range attributes {
 		switch attribute.Type {
 		case akaAttrRAND, akaAttrAUTN, akaAttrMAC, akaAttrResultInd:
+		case akaAttrCheckcode:
+			if responderCheckcode {
+				return eapAction{}, errors.New("ike: EAP-AKA challenge repeats AT_CHECKCODE")
+			}
+			responderCheckcode = true
+			// Checked before the SIM is touched: a challenge that disagrees about
+			// the identity round is not worth an AUTHENTICATE.
+			if err := client.verifyCheckcode(attribute); err != nil {
+				return eapAction{}, err
+			}
 		case akaAttrKDF, akaAttrKDFInput:
 			if client.method != eapTypeAKAPrime {
 				return eapAction{}, fmt.Errorf("ike: EAP-AKA challenge contains AKA' attribute %d", attribute.Type)
@@ -867,6 +942,18 @@ func (client *akaClient) respondAKAChallenge(
 	}
 	macResponse, _ := marshalAKAAttribute(akaAttrMAC, make([]byte, 18))
 	responseData := append([]byte{akaSubtypeChallenge, 0, 0}, resAttribute...)
+	// RFC 4187 Section 10.13 leaves the peer's AT_CHECKCODE optional, and omitting
+	// it is legal even when the responder sent one.  It is still sent whenever
+	// there is an identity round to protect: commercial UE stacks all echo it, so
+	// an AAA that has only ever seen those peers may take its absence for a fault.
+	// Sending it also puts the identity round under this message's AT_MAC.
+	if checkcode := client.checkcode(); len(checkcode) != 0 || responderCheckcode {
+		checkcodeAttribute, err := marshalAKAAttribute(akaAttrCheckcode, append([]byte{0, 0}, checkcode...))
+		if err != nil {
+			return eapAction{}, err
+		}
+		responseData = append(responseData, checkcodeAttribute...)
+	}
 	resultIndication := false
 	for _, attribute := range attributes {
 		if attribute.Type == akaAttrResultInd {

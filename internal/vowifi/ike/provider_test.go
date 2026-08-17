@@ -44,6 +44,7 @@ func (reader constantReader) Read(destination []byte) (int, error) {
 
 type firstAuthCaptureTransport struct {
 	t            *testing.T
+	wantEAPOnly  bool
 	allowSHA1    bool
 	legacyOnly   bool
 	useMODP1024  bool
@@ -228,8 +229,8 @@ func (transport *firstAuthCaptureTransport) observeFirstAuth(packet []byte) erro
 			foundEAPOnly = true
 		}
 	}
-	if !foundEAPOnly {
-		transport.t.Fatal("first IKE_AUTH omitted EAP_ONLY_AUTHENTICATION")
+	if foundEAPOnly != transport.wantEAPOnly {
+		transport.t.Fatalf("first IKE_AUTH EAP_ONLY_AUTHENTICATION = %v, want %v", foundEAPOnly, transport.wantEAPOnly)
 	}
 	for _, kind := range []uint8{payloadIDi, payloadSA, payloadTSi, payloadTSr, payloadCP} {
 		if _, err := onePayload(payloads, kind); err != nil {
@@ -302,7 +303,7 @@ func TestSessionCloseStopsRelayBeforeChildDataplane(t *testing.T) {
 }
 
 func TestProviderVodafoneFirstAuthIsEAPOnlyAndRequestsIMSAPN(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true, useMODP1024: true}
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: true, allowSHA1: true, useMODP1024: true}
 	provider, err := NewProvider(Config{
 		Random:      constantReader{value: 0x42},
 		Timeout:     time.Second,
@@ -346,7 +347,7 @@ func TestProviderVodafoneFirstAuthIsEAPOnlyAndRequestsIMSAPN(t *testing.T) {
 }
 
 func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t}
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: false}
 	var traced IKEAuthTraceEvent
 	traceSeen := false
 	provider, err := NewProvider(Config{
@@ -392,8 +393,8 @@ func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
 	if !traceSeen || traced.MessageID != 1 || len(traced.Payloads) != 9 {
 		t.Fatalf("Globe initial IKE_AUTH trace = %#v", traced)
 	}
-	if traced.Payloads[0].IdentityPrefix != "051502" || traced.Payloads[1].IdentityValue != "ims" {
-		t.Fatalf("Globe initial IKE_AUTH identities = %#v", traced.Payloads[:2])
+	if traced.Payloads[0].IdentityPrefix != "051502" || traced.Payloads[2].IdentityValue != "ims" {
+		t.Fatalf("Globe initial IKE_AUTH identities = %#v", traced.Payloads[:3])
 	}
 	if !traced.SameIMSI || !traced.PermanentIdentityMatchesExpected ||
 		traced.ModemIMSIHash == "" || traced.ModemIMSIHash != traced.EAPIMSIHash ||
@@ -403,7 +404,7 @@ func TestProviderGlobeUsesNAIIKEIdentityType(t *testing.T) {
 }
 
 func TestProviderVodafoneDefaultsToStrongCryptoDespitePLMN(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t}
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: true}
 	provider, err := NewProvider(Config{
 		Random:    constantReader{value: 0x42},
 		Timeout:   time.Second,
@@ -438,7 +439,7 @@ func TestProviderVodafoneDefaultsToStrongCryptoDespitePLMN(t *testing.T) {
 }
 
 func TestProviderTelefonicaGermanyAutomaticallyOffersSHA1WithMODP2048(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true}
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: true, allowSHA1: true}
 	provider, err := NewProvider(Config{
 		Random:    constantReader{value: 0x42},
 		Timeout:   time.Second,
@@ -612,7 +613,7 @@ var _ datagramTransport = (*firstAuthCaptureTransport)(nil)
 // hardware, so the carrier preset — not just the per-device toggle — has to be
 // able to select SHA-1 and MODP-1024.
 func TestProviderDITOPhilippinesNegotiatesLegacySuite(t *testing.T) {
-	capture := &firstAuthCaptureTransport{t: t, allowSHA1: true, legacyOnly: true, useMODP1024: true}
+	capture := &firstAuthCaptureTransport{t: t, wantEAPOnly: true, allowSHA1: true, legacyOnly: true, useMODP1024: true}
 	provider, err := NewProvider(Config{
 		Random:    constantReader{value: 0x42},
 		Timeout:   time.Second,

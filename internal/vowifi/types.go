@@ -250,6 +250,10 @@ type IMSRequest struct {
 	Identity SIMIdentity
 	Carrier  CarrierProfile
 	Tunnel   TunnelSession
+	// AKA is the session-scoped provider used for IMS 401 challenges. The
+	// orchestrator supplies an identity-gated wrapper here for multi-IMSI cards
+	// so IMS refresh authentication follows the same baseline as IKE EAP-AKA.
+	AKA AKAProvider
 }
 
 type IMSEvidence struct {

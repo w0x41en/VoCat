@@ -25,6 +25,7 @@ const (
 	payloadIDi       = 35
 	payloadIDr       = 36
 	payloadCert      = 37
+	payloadCertReq   = 38
 	payloadAuth      = 39
 	payloadNonce     = 40
 	payloadNotify    = 41
@@ -34,6 +35,10 @@ const (
 	payloadEncrypted = 46
 	payloadCP        = 47
 	payloadEAP       = 48
+
+	// certEncodingX509Signature is RFC 7296 "X.509 Certificate - Signature",
+	// the only encoding VoCat requests and the only one it parses.
+	certEncodingX509Signature = 4
 
 	protocolIKE = 1
 	protocolESP = 3

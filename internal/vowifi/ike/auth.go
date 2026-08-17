@@ -167,6 +167,16 @@ func validateInitialResponderAUTH(
 	if err := validateFQDNIDr(idr, expectedIDr, "initial ePDG"); err != nil {
 		return vowifi.ResponderAUTHInvalid, idr, err
 	}
+	if auth.Body[0] == authMethodSharedKeyMIC {
+		// A shared-key MIC is not a signature and has no certificate to verify
+		// it with, and the only key it could be keyed on -- the EAP MSK -- does
+		// not exist until the AKA challenge completes.  Responder
+		// authentication is therefore deferred to the mandatory MSK AUTH check
+		// after EAP, exactly as it is when the responder omits AUTH entirely.
+		// Reporting "missing" keeps the exchange fail-closed: nothing marks the
+		// responder verified except that later check.
+		return vowifi.ResponderAUTHMissing, idr, nil
+	}
 	publicKey := pinned
 	if publicKey == nil {
 		certificates, err := parseResponderCertificates(payloads)
@@ -174,7 +184,14 @@ func validateInitialResponderAUTH(
 			return vowifi.ResponderAUTHInvalid, idr, err
 		}
 		if len(certificates) == 0 {
-			return vowifi.ResponderAUTHInvalid, idr, errors.New("ike: responder AUTH has no certificate or pinned public key")
+			// Report what actually arrived: whether the responder withheld the
+			// chain, sent an encoding VoCat does not parse, or authenticated
+			// with a method that carries no certificate at all are three very
+			// different faults with the same symptom.
+			return vowifi.ResponderAUTHInvalid, idr, fmt.Errorf(
+				"ike: responder AUTH has no certificate or pinned public key: auth_method=%d payloads=[%s]",
+				auth.Body[0], payloadTypeSummary(payloads),
+			)
 		}
 		if err := verifyResponderCertificate(certificates, roots, serverName); err != nil {
 			return vowifi.ResponderAUTHInvalid, idr, err
@@ -209,13 +226,53 @@ func validateFQDNIDr(idr payload, expectedIDr string, label string) error {
 	return nil
 }
 
+// validateAPNIDr checks the APN the responder confirms in the final IKE_AUTH.
+// An ePDG may echo either the bare APN network identifier ("ims") or the full
+// TS 23.003 APN FQDN ("ims.apn.epc.mncXXX.mccYYY.pub.3gppnetwork.org"); both
+// name the same APN, so the operator identifier suffix is accepted while a
+// different network identifier is still rejected.
+func validateAPNIDr(idr payload, apn string, label string) error {
+	if err := validateFQDNIDr(idr, "", label); err != nil {
+		return err
+	}
+	apn = strings.TrimSuffix(strings.TrimSpace(apn), ".")
+	if apn == "" {
+		return nil
+	}
+	identity := strings.TrimSuffix(strings.TrimSpace(string(idr.Body[4:])), ".")
+	if strings.EqualFold(identity, apn) {
+		return nil
+	}
+	if len(identity) > len(apn)+1 &&
+		strings.EqualFold(identity[:len(apn)], apn) &&
+		identity[len(apn)] == '.' {
+		return nil
+	}
+	return fmt.Errorf("ike: %s IDr %q does not name APN %q", label, identity, apn)
+}
+
+// payloadTypeSummary names the payloads of a received message for diagnostics.
+// CERT payloads also report their encoding byte, because a chain sent as "hash
+// and URL" looks identical to no chain at all in the failure that uses this.
+func payloadTypeSummary(payloads []payload) string {
+	names := make([]string, 0, len(payloads))
+	for _, item := range payloads {
+		name := ikePayloadName(item.Type)
+		if item.Type == payloadCert && len(item.Body) > 0 {
+			name = fmt.Sprintf("%s(encoding=%d)", name, item.Body[0])
+		}
+		names = append(names, name)
+	}
+	return strings.Join(names, " ")
+}
+
 func parseResponderCertificates(payloads []payload) ([]*x509.Certificate, error) {
 	var certificates []*x509.Certificate
 	for _, item := range payloadsOfType(payloads, payloadCert) {
 		if len(item.Body) < 2 {
 			return nil, errors.New("ike: responder certificate payload is truncated")
 		}
-		if item.Body[0] != 4 {
+		if item.Body[0] != certEncodingX509Signature {
 			return nil, fmt.Errorf("ike: unsupported responder certificate encoding %d", item.Body[0])
 		}
 		certificate, err := x509.ParseCertificate(item.Body[1:])

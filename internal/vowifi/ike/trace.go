@@ -182,6 +182,8 @@ func ikePayloadName(kind uint8) string {
 		return "IDr"
 	case payloadCert:
 		return "CERT"
+	case payloadCertReq:
+		return "CERTREQ"
 	case payloadAuth:
 		return "AUTH"
 	case payloadNonce:

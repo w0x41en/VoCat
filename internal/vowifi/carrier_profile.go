@@ -19,6 +19,7 @@ type CarrierProfile struct {
 	PresetID          string `json:"preset_id,omitempty"`
 	Source            string `json:"source,omitempty"`
 	EPDG              string `json:"epdg,omitempty"`
+	EPDGIdentity      string `json:"epdg_identity,omitempty"`
 	IKEIdentityType   uint8  `json:"ike_identity_type,omitempty"`
 	IMSAPN            string `json:"ims_apn,omitempty"`
 	EAPMethod         string `json:"eap_method,omitempty"`
@@ -57,11 +58,17 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 	}
 	plmn := mcc + canonicalMNC
 	profile := CarrierProfile{
-		MCC:               mcc,
-		MNC:               canonicalMNC,
-		PLMN:              plmn,
-		PresetID:          plmn,
-		Source:            CarrierSourceFallback,
+		MCC:      mcc,
+		MNC:      canonicalMNC,
+		PLMN:     plmn,
+		PresetID: plmn,
+		Source:   CarrierSourceFallback,
+		// The ePDG names itself in IKE IDr with the TS 23.003 PLMN FQDN, which
+		// is an identity and not an address: operators such as Globe publish a
+		// separate vanity hostname for dialling and leave this name
+		// unresolvable on the public internet.  Keep the two apart so IDr is
+		// checked against the identity and the certificate against the host.
+		EPDGIdentity:      derivedEPDGIdentity(mcc, canonicalMNC),
 		IMSAPN:            "ims",
 		EAPMethod:         "aka",
 		IMSTransport:      "tcp",
@@ -94,12 +101,26 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		profile.PresetID = "Globe_PH_51502"
 		profile.Source = CarrierSourceBuiltin
 		profile.EPDG = "weconnect.globe.com.ph"
+		// Globe owns mnc002.mcc515.pub.3gppnetwork.org (SOA g-net1.globe.com.ph)
+		// but all three of its authoritative servers answer NXDOMAIN for the
+		// epdg.epc label, so the identity below never resolves publicly.  It is
+		// still what the ePDG puts in IDr, which is all it is used for.
+		profile.EPDGIdentity = "epdg.epc.mnc002.mcc515.pub.3gppnetwork.org"
 		// The permanent EAP-AKA NAI is carried in IKE IDi as
 		// ID_RFC822_ADDR (type 3). ID_FQDN (type 2) is reserved for the
 		// requested APN in IDr below.
 		profile.IKEIdentityType = 3 // ID_RFC822_ADDR / NAI
 	}
 	return profile
+}
+
+// derivedEPDGIdentity builds the TS 23.003 ePDG FQDN.  The MNC is already
+// zero-padded to three digits by the caller: Globe's own DNS zone is named
+// mnc002, so the padded form is the operator-recognised one even though the
+// unpadded mnc02 label is what a public resolver answers (with a 127.0.0.1
+// wildcard sinkhole that is not an ePDG).
+func derivedEPDGIdentity(mcc string, canonicalMNC string) string {
+	return fmt.Sprintf("epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org", canonicalMNC, mcc)
 }
 
 func (profile CarrierProfile) String() string {

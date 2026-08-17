@@ -272,7 +272,7 @@ func openQMIUIMSession(
 ) (qmiUIMSession, error) {
 	openCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	lease, err := qmiport.Acquire(openCtx, controlDevice)
+	lease, err := qmiport.Acquire(openCtx, controlDevice, "vowifi-aka-uim")
 	if err != nil {
 		return nil, err
 	}

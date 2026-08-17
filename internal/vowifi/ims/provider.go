@@ -326,6 +326,11 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.IMSRequest) 
 	if !localAddressProvenByTunnel(localAddress, tunnel) {
 		return nil, errors.New("ims: configured local address is not assigned by the SWu tunnel")
 	}
+	if request.AKA != nil {
+		copy := *provider
+		copy.aka = request.AKA
+		provider = &copy
+	}
 
 	connection, err := dialSIP(ctx, transport, localAddress, 0, endpoint.address())
 	if err != nil {

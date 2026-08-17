@@ -248,6 +248,16 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 	if err != nil {
 		return fail(PhaseAccessReady, err)
 	}
+	akaProvider := orchestrator.deps.AKA
+	if orchestrator.options.IdentityFlapTolerance > 0 {
+		akaProvider = newAKAIdentityGate(
+			akaProvider,
+			orchestrator.deps.SIM,
+			orchestrator.options.DeviceID,
+			defaultAKAIdentityGateInterval,
+			orchestrator.options.Logger,
+		)
+	}
 	orchestrator.mutate(func(state *State) {
 		state.PureAirplanePolicy = resources.radio.PureAirplanePolicy
 	})
@@ -282,7 +292,7 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 		Carrier:  carrierProfile,
 		EPDG:     epdg,
 		Proxy:    proxy,
-		AKA:      orchestrator.deps.AKA,
+		AKA:      akaProvider,
 		Security: TunnelSecurityPolicy{
 			AllowMissingResponderAUTH: orchestrator.options.AllowMissingResponderAUTH,
 		},
@@ -323,6 +333,7 @@ func (orchestrator *Orchestrator) Enable(ctx context.Context) (State, error) {
 		Identity: identity,
 		Carrier:  carrierProfile,
 		Tunnel:   tunnel,
+		AKA:      akaProvider,
 	})
 	if err != nil {
 		return fail(PhaseIMSReady, err)
@@ -768,11 +779,7 @@ func deriveEPDG(identity SIMIdentity, profile CarrierProfile) (string, error) {
 	for len(mnc) < 3 {
 		mnc = "0" + mnc
 	}
-	return fmt.Sprintf(
-		"epdg.epc.mnc%s.mcc%s.pub.3gppnetwork.org",
-		mnc,
-		strings.TrimSpace(identity.HomeMCC),
-	), nil
+	return derivedEPDGIdentity(strings.TrimSpace(identity.HomeMCC), mnc), nil
 }
 
 func epdgSource(identity SIMIdentity, profile CarrierProfile) string {

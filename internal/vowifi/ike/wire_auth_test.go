@@ -61,27 +61,33 @@ func TestInitialEAPOnlyAuthCarriesAPNIDrAndNotify(t *testing.T) {
 		dualStackTrafficSelectors(payloadTSi),
 		dualStackTrafficSelectors(payloadTSr),
 	)
-	if len(payloads) != 9 || payloads[0].Type != payloadIDi || payloads[1].Type != payloadIDr {
+	if len(payloads) != 10 || payloads[0].Type != payloadIDi ||
+		payloads[1].Type != payloadCertReq || payloads[2].Type != payloadIDr {
 		t.Fatalf("initial auth payload order = %#v", payloads)
 	}
-	if got := string(payloads[1].Body[4:]); got != "ims" || payloads[1].Body[0] != 2 {
-		t.Fatalf("IDr = type %d value %q, want ID_FQDN ims", payloads[1].Body[0], got)
+	// An empty certification authority list means "no CA preference", which is
+	// what makes a responder send its chain instead of withholding it.
+	if len(payloads[1].Body) != 1 || payloads[1].Body[0] != certEncodingX509Signature {
+		t.Fatalf("CERTREQ body = %x, want a bare X.509 signature encoding", payloads[1].Body)
 	}
-	kind, data, err := parseNotify(payloads[2])
+	if got := string(payloads[2].Body[4:]); got != "ims" || payloads[2].Body[0] != 2 {
+		t.Fatalf("IDr = type %d value %q, want ID_FQDN ims", payloads[2].Body[0], got)
+	}
+	kind, data, err := parseNotify(payloads[3])
 	if err != nil {
 		t.Fatalf("parseNotify(EAP_ONLY_AUTHENTICATION) error = %v", err)
 	}
 	if kind != notifyEAPOnlyAuth || len(data) != 0 {
 		t.Fatalf("notify = %d/%x, want EAP_ONLY_AUTHENTICATION", kind, data)
 	}
-	kind, data, err = parseNotify(payloads[3])
+	kind, data, err = parseNotify(payloads[4])
 	if err != nil {
 		t.Fatalf("parseNotify() error = %v", err)
 	}
 	if kind != notifyMOBIKESupported || len(data) != 0 {
 		t.Fatalf("notify = %d/%x, want MOBIKE_SUPPORTED", kind, data)
 	}
-	kind, data, err = parseNotify(payloads[4])
+	kind, data, err = parseNotify(payloads[5])
 	if err != nil {
 		t.Fatalf("parseNotify() error = %v", err)
 	}
@@ -114,7 +120,8 @@ func TestInitialStandardEAPAuthOmitsEAPOnlyNotify(t *testing.T) {
 		dualStackTrafficSelectors(payloadTSr),
 		false,
 	)
-	if len(payloads) != 8 || payloads[0].Type != payloadIDi || payloads[1].Type != payloadIDr {
+	if len(payloads) != 9 || payloads[0].Type != payloadIDi ||
+		payloads[1].Type != payloadCertReq || payloads[2].Type != payloadIDr {
 		t.Fatalf("initial standard EAP payload order = %#v", payloads)
 	}
 	initialContact := 0
@@ -140,8 +147,8 @@ func TestInitialStandardEAPAuthOmitsEAPOnlyNotify(t *testing.T) {
 	if mobikeSupported != 1 {
 		t.Fatalf("standard EAP initial request MOBIKE_SUPPORTED count = %d, want 1", mobikeSupported)
 	}
-	if payloads[2].Type != payloadNotify || payloads[3].Type != payloadNotify {
-		t.Fatalf("standard EAP Android notify order = %#v", payloads[:4])
+	if payloads[3].Type != payloadNotify || payloads[4].Type != payloadNotify {
+		t.Fatalf("standard EAP Android notify order = %#v", payloads[:5])
 	}
 }
 
@@ -177,6 +184,14 @@ func TestO2GermanyUsesStandardEAPAuthentication(t *testing.T) {
 	}
 	if !advertiseEAPOnlyAuthentication("262", "02") || !advertiseEAPOnlyAuthentication("234", "15") {
 		t.Fatal("non-O2 PLMN lost the existing EAP-only policy")
+	}
+}
+
+func TestGlobeUsesStandardEAPAuthentication(t *testing.T) {
+	for _, mnc := range []string{"02", "002"} {
+		if advertiseEAPOnlyAuthentication("515", mnc) {
+			t.Fatalf("Globe Philippines 515-%s unexpectedly uses EAP-only", mnc)
+		}
 	}
 }
 
@@ -273,5 +288,72 @@ func TestConfigurationIPv6PrefixIsMandatoryAndPreserved(t *testing.T) {
 	invalidBody = append(invalidBody, ipv6...)
 	if _, err := parseConfiguration(payload{Type: payloadCP, Body: invalidBody}); err == nil {
 		t.Fatal("16-byte INTERNAL_IP6_ADDRESS without prefix was accepted")
+	}
+}
+
+func TestValidateAPNIDrAcceptsBareAndFullyQualifiedAPN(t *testing.T) {
+	idr := func(identity string) payload {
+		return payload{Type: payloadIDr, Body: append([]byte{2, 0, 0, 0}, []byte(identity)...)}
+	}
+	accepted := []string{
+		"ims",
+		"IMS",
+		"ims.apn.epc.mnc002.mcc515.pub.3gppnetwork.org",
+		"ims.apn.epc.mnc002.mcc515.pub.3gppnetwork.org.",
+	}
+	for _, identity := range accepted {
+		if err := validateAPNIDr(idr(identity), "ims", "final APN"); err != nil {
+			t.Fatalf("APN IDr %q rejected: %v", identity, err)
+		}
+	}
+	rejected := []string{
+		"internet",
+		"imsx",
+		"imsx.apn.epc.mnc002.mcc515.pub.3gppnetwork.org",
+		"apn.epc.mnc002.mcc515.pub.3gppnetwork.org",
+		"",
+	}
+	for _, identity := range rejected {
+		if err := validateAPNIDr(idr(identity), "ims", "final APN"); err == nil {
+			t.Fatalf("APN IDr %q was accepted", identity)
+		}
+	}
+	wrongType := idr("ims")
+	wrongType.Body[0] = 11
+	if err := validateAPNIDr(wrongType, "ims", "final APN"); err == nil {
+		t.Fatal("non-ID_FQDN APN IDr was accepted")
+	}
+}
+
+func TestInitialResponderAUTHDefersSharedKeyMIC(t *testing.T) {
+	idr := payload{
+		Type: payloadIDr,
+		Body: append([]byte{2, 0, 0, 0}, []byte("epdg.epc.mnc002.mcc515.pub.3gppnetwork.org")...),
+	}
+	// Globe's ePDG answers the first IKE_AUTH with IDr + AUTH + EAP where AUTH
+	// is a shared-key MIC and no certificate is present.  That AUTH cannot be
+	// verified yet, so the exchange must continue rather than fail, and it must
+	// not be reported as verified.
+	mic := payload{Type: payloadAuth, Body: append([]byte{authMethodSharedKeyMIC, 0, 0, 0}, bytes.Repeat([]byte{0xab}, 20)...)}
+	payloads := []payload{idr, mic, {Type: payloadEAP, Body: []byte{1, 0, 0, 5, 1}}}
+	status, responderID, err := validateInitialResponderAUTH(
+		payloads, nil, nil, negotiatedSuite{}, nil,
+		"epdg.epc.mnc002.mcc515.pub.3gppnetwork.org", "weconnect.globe.com.ph", nil, nil, true,
+	)
+	if err != nil {
+		t.Fatalf("shared-key MIC initial AUTH rejected: %v", err)
+	}
+	if status != vowifi.ResponderAUTHMissing {
+		t.Fatalf("responder AUTH status = %q, want %q", status, vowifi.ResponderAUTHMissing)
+	}
+	if !bytes.Equal(responderID.Body, idr.Body) {
+		t.Fatalf("responder IDr = %#v, want the initial IDr for the final AUTH transcript", responderID)
+	}
+	// A mismatched identity must still fail, deferral or not.
+	if _, _, err := validateInitialResponderAUTH(
+		payloads, nil, nil, negotiatedSuite{}, nil,
+		"epdg.epc.mnc066.mcc515.pub.3gppnetwork.org", "weconnect.globe.com.ph", nil, nil, true,
+	); err == nil {
+		t.Fatal("shared-key MIC deferral accepted a mismatched ePDG identity")
 	}
 }

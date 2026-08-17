@@ -74,3 +74,37 @@ func TestResolveCarrierProfileFailsClosedForMissingPLMN(t *testing.T) {
 		t.Fatalf("profile = %#v", profile)
 	}
 }
+
+func TestResolveCarrierProfileSeparatesEPDGIdentityFromHostname(t *testing.T) {
+	cases := []struct {
+		name     string
+		mcc      string
+		mnc      string
+		epdg     string
+		identity string
+	}{
+		// Globe dials a vanity hostname but names itself with the PLMN FQDN.
+		{name: "Globe", mcc: "515", mnc: "02", epdg: "weconnect.globe.com.ph", identity: "epdg.epc.mnc002.mcc515.pub.3gppnetwork.org"},
+		// Carriers without a vanity hostname keep identity == dialled host.
+		{name: "DITO", mcc: "515", mnc: "066", identity: "epdg.epc.mnc066.mcc515.pub.3gppnetwork.org"},
+		{name: "Vodafone UK", mcc: "234", mnc: "15", identity: "epdg.epc.mnc015.mcc234.pub.3gppnetwork.org"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			profile := ResolveCarrierProfile(SIMIdentity{HomeMCC: testCase.mcc, HomeMNC: testCase.mnc})
+			if profile.EPDGIdentity != testCase.identity {
+				t.Fatalf("ePDG identity = %q, want %q", profile.EPDGIdentity, testCase.identity)
+			}
+			if profile.EPDG != testCase.epdg {
+				t.Fatalf("ePDG hostname = %q, want %q", profile.EPDG, testCase.epdg)
+			}
+		})
+	}
+}
+
+func TestResolveCarrierProfileOmitsEPDGIdentityWithoutPLMN(t *testing.T) {
+	profile := ResolveCarrierProfile(SIMIdentity{IMSI: "515021234567890"})
+	if profile.EPDGIdentity != "" {
+		t.Fatalf("ePDG identity = %q, want empty", profile.EPDGIdentity)
+	}
+}

@@ -369,7 +369,11 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 	requestedIDr := payload{Type: payloadIDr, Body: append([]byte{2, 0, 0, 0}, []byte(apn)...)}
 	tsi := dualStackTrafficSelectors(payloadTSi)
 	tsr := dualStackTrafficSelectors(payloadTSr)
-	firstAuthPayloads := buildInitialEAPOnlyAuth(idi, requestedIDr, childOfferBody, tsi, tsr)
+	// RFC 5998 EAP-only authentication is not accepted by every ePDG.  Keep
+	// the carrier-scoped compatibility decision in one place instead of
+	// unconditionally adding the notify to every first IKE_AUTH.
+	eapOnly := advertiseEAPOnlyAuthentication(request.Identity.HomeMCC, request.Identity.HomeMNC)
+	firstAuthPayloads := buildInitialEAPAuth(idi, requestedIDr, childOfferBody, tsi, tsr, eapOnly)
 	if provider.config.IKETrace != nil {
 		trace := traceIKEAuthPayloads("tx", 1, firstAuthPayloads)
 		identityAudit := traceAKAIdentityAudit(request.Identity, aka.identity, aka.method)
@@ -404,9 +408,25 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		return nil, err
 	}
 	_ = authResponseHeader
+	// Trace the response as well as the request.  Every authentication fault
+	// past this point is a statement about what the ePDG sent, so recording
+	// only the transmitted payloads leaves the failing message invisible.
+	if provider.config.IKETrace != nil {
+		provider.config.IKETrace(traceIKEAuthPayloads("rx", 1, authResponsePayloads))
+	}
 	serverName := strings.TrimSpace(provider.config.ServerName)
 	if serverName == "" {
 		serverName = epdg
+	}
+	// The responder's IKE identity and the hostname it was dialled at are two
+	// different names.  An ePDG names itself with the TS 23.003 PLMN FQDN even
+	// when the operator publishes a vanity hostname for dialling, so IDr is
+	// matched against the carrier identity and only the certificate is matched
+	// against serverName.  Carriers without a known identity keep the old
+	// behaviour of requiring IDr to equal the dialled host.
+	expectedIDr := strings.TrimSpace(request.Carrier.EPDGIdentity)
+	if expectedIDr == "" {
+		expectedIDr = serverName
 	}
 	responderAUTH, responderID, err := validateInitialResponderAUTH(
 		authResponsePayloads,
@@ -414,7 +434,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		initiatorNonce,
 		ikeSuite,
 		keys.SKpr,
-		serverName,
+		expectedIDr,
 		serverName,
 		provider.config.RootCAs,
 		provider.config.ResponderPublicKey,
@@ -442,6 +462,18 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		}
 		if len(action.Response) == 0 {
 			if packet, parseErr := parseEAPPacket(eapPayload.Body); parseErr == nil {
+				// An EAP-Failure that RFC 4187 Section 6.3.3 does not permit is
+				// discarded rather than acted on, which leaves the state machine
+				// with nothing to send.  Name that case explicitly: it is the
+				// peer rejecting the subscriber, not VoCat losing track of the
+				// exchange, and the two were previously indistinguishable here.
+				if packet.Code == eapFailure {
+					return nil, fmt.Errorf(
+						"%w: responder sent an unsolicited EAP-Failure %s (identifier=%d, method_started=%t, challenge_complete=%t)",
+						vowifi.ErrEAPAuthenticationRejected, eapFailureStage(aka),
+						packet.Identifier, aka.methodStarted, aka.challengeComplete,
+					)
+				}
 				return nil, fmt.Errorf(
 					"ike: EAP state machine produced no response: code=%d identifier=%d type=%d method_started=%t challenge_complete=%t failure_expected=%t",
 					packet.Code, packet.Identifier, packet.Type,
@@ -528,7 +560,7 @@ func (provider *Provider) Start(ctx context.Context, request vowifi.TunnelReques
 		return nil, errors.New("ike: duplicate final responder IDr payload")
 	}
 	if len(finalIDs) == 1 {
-		if err := validateFQDNIDr(finalIDs[0], apn, "final APN"); err != nil {
+		if err := validateAPNIDr(finalIDs[0], apn, "final APN"); err != nil {
 			return nil, fmt.Errorf("ike: final APN IDr: %w", err)
 		}
 	}
@@ -705,14 +737,20 @@ func legacyIKEProfile(mcc, mnc string) bool {
 }
 
 func advertiseEAPOnlyAuthentication(mcc, mnc string) bool {
-	// O2 Germany's 262-03 ePDG rejects an explicit RFC 5998 EAP-only notify;
-	// other tested PLMNs still require it for the Android-compatible exchange.
-	return !o2GermanyIKECompatibility(mcc, mnc)
+	// O2 Germany's 262-03 and Globe Philippines' 515-02 ePDGs reject an
+	// explicit RFC 5998 EAP-only notify; other tested PLMNs still require it
+	// for the Android-compatible exchange.
+	return !standardEAPAuthenticationCompatibility(mcc, mnc)
 }
 
 func o2GermanyIKECompatibility(mcc, mnc string) bool {
 	plmn := strings.TrimSpace(mcc) + strings.TrimLeft(strings.TrimSpace(mnc), "0")
 	return plmn == "2623"
+}
+
+func standardEAPAuthenticationCompatibility(mcc, mnc string) bool {
+	plmn := strings.TrimSpace(mcc) + strings.TrimLeft(strings.TrimSpace(mnc), "0")
+	return o2GermanyIKECompatibility(mcc, mnc) || plmn == "5152"
 }
 
 func buildInitialEAPAuth(
@@ -723,7 +761,7 @@ func buildInitialEAPAuth(
 	tsr payload,
 	eapOnly bool,
 ) []payload {
-	payloads := []payload{idi, requestedIDr}
+	payloads := []payload{idi, certificateRequest(), requestedIDr}
 	if eapOnly {
 		payloads = append(payloads, makeNotify(notifyEAPOnlyAuth, nil))
 	}
@@ -737,6 +775,18 @@ func buildInitialEAPAuth(
 		tsr,
 		configurationRequest(),
 	)
+}
+
+// certificateRequest asks the responder for its certificate chain.  RFC 7296
+// Section 3.7 leaves the CERT payload optional, and ePDGs that decline
+// EAP-only authentication commonly withhold their chain unless a CERTREQ is
+// present, which leaves the responder AUTH unverifiable.  The certification
+// authority list is intentionally empty: it means "no CA preference", so the
+// responder sends whatever chain it has and VoCat validates it against its own
+// roots afterwards.  Naming specific CAs here would let the responder decide it
+// has no acceptable chain and send nothing at all.
+func certificateRequest() payload {
+	return payload{Type: payloadCertReq, Body: []byte{certEncodingX509Signature}}
 }
 
 func buildInitialEAPOnlyAuth(
