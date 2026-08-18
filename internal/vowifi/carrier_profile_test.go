@@ -68,6 +68,16 @@ func TestGlobeProfileUsesStaticEPDG(t *testing.T) {
 	}
 }
 
+func TestSmartProfileUsesBareIMSAPN(t *testing.T) {
+	profile := ResolveCarrierProfile(SIMIdentity{HomeMCC: "515", HomeMNC: "03"})
+	if profile.PresetID != "Smart_PH_51503" || profile.Source != CarrierSourceBuiltin {
+		t.Fatalf("profile = %#v", profile)
+	}
+	if profile.IMSAPN != "ims" {
+		t.Fatalf("Smart IMS APN = %q", profile.IMSAPN)
+	}
+}
+
 func TestResolveCarrierProfileFailsClosedForMissingPLMN(t *testing.T) {
 	profile := ResolveCarrierProfile(SIMIdentity{IMSI: "262031234567890"})
 	if profile.PLMN != "" || profile.PresetID != "" || profile.Source != CarrierSourceFallback {
@@ -106,5 +116,37 @@ func TestResolveCarrierProfileOmitsEPDGIdentityWithoutPLMN(t *testing.T) {
 	profile := ResolveCarrierProfile(SIMIdentity{IMSI: "515021234567890"})
 	if profile.EPDGIdentity != "" {
 		t.Fatalf("ePDG identity = %q, want empty", profile.EPDGIdentity)
+	}
+}
+
+// The two PLMNs whose ePDG refuses the RFC 5998 EAP-only notification also do
+// not send an initial AUTH, so the profile has to permit both halves together.
+// Getting only one of them breaks the exchange at IKE_AUTH.
+func TestCarrierProfileTolerantOfMissingResponderAUTHOnlyWhereObserved(t *testing.T) {
+	cases := []struct {
+		name string
+		mcc  string
+		mnc  string
+		want bool
+	}{
+		{name: "O2 Germany omits AUTH", mcc: "262", mnc: "03", want: true},
+		{name: "Globe omits AUTH", mcc: "515", mnc: "02", want: true},
+		{name: "Vodafone UK stays strict", mcc: "234", mnc: "15", want: false},
+		{name: "DITO stays strict", mcc: "515", mnc: "066", want: false},
+		{name: "unprofiled carrier stays strict", mcc: "460", mnc: "01", want: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			profile := ResolveCarrierProfile(SIMIdentity{
+				HomeMCC: testCase.mcc,
+				HomeMNC: testCase.mnc,
+			})
+			if profile.AllowMissingResponderAUTH != testCase.want {
+				t.Fatalf(
+					"AllowMissingResponderAUTH for %s-%s = %v, want %v",
+					testCase.mcc, testCase.mnc, profile.AllowMissingResponderAUTH, testCase.want,
+				)
+			}
+		})
 	}
 }

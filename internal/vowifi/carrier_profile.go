@@ -28,6 +28,12 @@ type CarrierProfile struct {
 	UseMODP1024       bool   `json:"use_modp1024,omitempty"`
 	LegacyIKEOnly     bool   `json:"legacy_ike_only,omitempty"`
 	IMSIdentitySource string `json:"ims_identity_source,omitempty"`
+	// AllowMissingResponderAUTH tolerates an initial IKE_AUTH response that
+	// omits AUTH even though this client did not request RFC 5998 EAP-only
+	// authentication.  RFC 5998 Section 3 requires such a responder to send
+	// AUTH, so this is a per-carrier deviation and never a global default: the
+	// final MSK AUTH check stays mandatory either way.
+	AllowMissingResponderAUTH bool `json:"allow_missing_responder_auth,omitempty"`
 }
 
 const (
@@ -81,9 +87,23 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		profile.PresetID = "O2_de_26203"
 		profile.Source = CarrierSourceBuiltin
 		profile.AllowSHA1 = true
+		// Observed 2026-08-17: this ePDG rejects an explicit RFC 5998 EAP-only
+		// notification and then omits AUTH from the initial IKE_AUTH response
+		// anyway, which RFC 5998 Section 3 does not permit.  The two facts are
+		// one behaviour -- the network does EAP-only authentication but will not
+		// negotiate it -- so suppressing the notify and tolerating the missing
+		// AUTH have to be set together or the exchange cannot complete.
+		profile.AllowMissingResponderAUTH = true
 	case "234015":
 		profile.PresetID = "Vodafone_uk_23415"
 		profile.Source = CarrierSourceBuiltin
+	case "515003":
+		// Smart Philippines uses the bare IMS APN in the Apple carrier bundle.
+		// The canonical APN-FQDN form was rejected by Smart's ePDG before
+		// EAP-AKA started; keep the network-facing IDr as "ims".
+		profile.PresetID = "Smart_PH_51503"
+		profile.Source = CarrierSourceBuiltin
+		profile.IMSAPN = "ims"
 	case "515066":
 		// DITO Philippines accepts a single IKE suite on its ePDG:
 		// AES-CBC-128 with HMAC-SHA1 and MODP-1024. Every stronger offer is
@@ -110,6 +130,13 @@ func ResolveCarrierProfile(identity SIMIdentity) CarrierProfile {
 		// ID_RFC822_ADDR (type 3). ID_FQDN (type 2) is reserved for the
 		// requested APN in IDr below.
 		profile.IKEIdentityType = 3 // ID_RFC822_ADDR / NAI
+		// Globe is the other PLMN whose ePDG refuses the RFC 5998 EAP-only
+		// notification.  Set precautionarily rather than from an observed
+		// response: this network is reached only far enough to fail at
+		// EAP-AKA, and requiring an initial AUTH it may not send would stop
+		// that investigation at IKE instead.  Drop it once a capture shows the
+		// ePDG does send AUTH.
+		profile.AllowMissingResponderAUTH = true
 	}
 	return profile
 }

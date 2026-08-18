@@ -550,6 +550,62 @@ func newAKAClient(identity vowifi.SIMIdentity, provider vowifi.AKAProvider) (*ak
 	return newAKAClientWithMethod(identity, provider, "aka")
 }
 
+// HTTPEmbeddedEAPClient is the EAP-AKA state machine used by TS.43/RCC.14
+// HTTP relay clients.  It deliberately exposes only the packet-in/packet-out
+// boundary; AKA keys, SIM vectors, and the permanent identity remain private
+// to this package.
+type HTTPEmbeddedEAPClient struct {
+	client *akaClient
+}
+
+// NewHTTPEmbeddedEAPClient creates an EAP-AKA client for an HTTP relay
+// exchange.  method accepts "aka" or "aka-prime" and follows the same
+// explicit anti-downgrade policy as the IKE provider.
+func NewHTTPEmbeddedEAPClient(
+	identity vowifi.SIMIdentity,
+	provider vowifi.AKAProvider,
+	method string,
+) (*HTTPEmbeddedEAPClient, error) {
+	client, err := newAKAClientWithMethod(identity, provider, method)
+	if err != nil {
+		return nil, err
+	}
+	return &HTTPEmbeddedEAPClient{client: client}, nil
+}
+
+// Handle processes one EAP packet received from the entitlement server.  The
+// returned response is ready to place in an RCC.14 eap-relay-packet object;
+// success is true only after a valid authenticated EAP-Success packet.
+func (client *HTTPEmbeddedEAPClient) Handle(
+	ctx context.Context,
+	packet []byte,
+) (response []byte, success bool, err error) {
+	if client == nil || client.client == nil {
+		return nil, false, errors.New("ike: HTTP EAP client is not configured")
+	}
+	action, err := client.client.handle(ctx, packet)
+	if err != nil {
+		return nil, false, err
+	}
+	return append([]byte(nil), action.Response...), action.Success, nil
+}
+
+// PermanentAKAIdentity returns the RFC 4187/5448 root NAI used as the
+// TS.43 EAP_ID query parameter.  It is intentionally an explicit helper so
+// diagnostic tools do not duplicate the PLMN/MNC normalization logic.
+func PermanentAKAIdentity(identity vowifi.SIMIdentity, method string) (string, error) {
+	methodCode := uint8(eapTypeAKA)
+	if strings.EqualFold(strings.TrimSpace(method), "aka-prime") ||
+		strings.EqualFold(strings.TrimSpace(method), "aka'") {
+		methodCode = eapTypeAKAPrime
+	}
+	encoded, err := permanentAKAIdentityForType(identity, methodCode)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
 func newAKAClientWithMethod(identity vowifi.SIMIdentity, provider vowifi.AKAProvider, methodName string) (*akaClient, error) {
 	if provider == nil {
 		return nil, errors.New("ike: AKA provider is required")
