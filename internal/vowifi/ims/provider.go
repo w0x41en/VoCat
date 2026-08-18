@@ -92,6 +92,16 @@ type SMSDeliveryReport struct {
 	// Target is the URI the report was sent to, empty when the inbound message
 	// carried neither a P-Asserted-Identity nor a From URI to answer.
 	Target string
+	// TargetSource names where Target came from ("p_asserted_identity",
+	// "rp_originating", "identity_smsc", "config_smsc" or "from"), and Attempt
+	// counts from 1 — a second attempt means the first routing was rejected and
+	// the other candidate was tried.
+	TargetSource string
+	Attempt      int
+	// AssertedIdentity is the P-Asserted-Identity of the inbound message. It is
+	// kept even when unroutable, because a bare hostname there is what forces
+	// the service-centre fallback.
+	AssertedIdentity string
 	// StatusCode is the SIP status of the report transaction, or 0 when no
 	// response arrived.
 	StatusCode int
@@ -630,6 +640,10 @@ type Session struct {
 	smsSubmit          map[byte]*smsSubmitTransaction
 	smsServerMu        sync.Mutex
 	smsServer          map[smsServerTransactionKey]*smsServerTransaction
+	// deliveryRoutesMu guards the RP-ACK routing a service centre was last seen
+	// to accept, so only the first report of a session pays for a rejection.
+	deliveryRoutesMu sync.Mutex
+	deliveryRoutes   map[string]string
 	callMu             sync.Mutex
 	calls              map[string]*imsCall
 

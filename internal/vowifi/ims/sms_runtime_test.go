@@ -767,47 +767,144 @@ func TestPublicIdentityForRequestFallsBackToTemporaryIMPU(t *testing.T) {
 	}
 }
 
-func TestDeliveryReportTargetPrefersRPOriginatingAddress(t *testing.T) {
+func TestDeliveryReportTargetsPreferAssertedIdentityThenRPOriginatingAddress(t *testing.T) {
 	session := &Session{
 		request:  vowifi.IMSRequest{Identity: vowifi.SIMIdentity{IMSI: "515661000061889", SMSC: "+639171234567"}},
 		provider: &Provider{config: Config{SMSCenter: "+447700900123"}},
 	}
-	// A bare hostname PAI is exactly the shape that drew 403 "Invalid User".
+	// A bare hostname PAI is exactly the shape that drew 403 "Invalid User", so
+	// DITO must keep falling straight through to the service centre.
 	hostOnly := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
 		"p-asserted-identity": {"sip:CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org"},
 		"from":                {"<sip:ipsmgw@example.test>;tag=gw"},
 	}}
-
-	if got := session.deliveryReportTarget(hostOnly, "+639171234567"); got != "tel:+639171234567" {
-		t.Fatalf("RP-OA target = %q", got)
-	}
-	if got := session.deliveryReportTarget(hostOnly, ""); got != "tel:+639171234567" {
-		t.Fatalf("configured SMSC target = %q", got)
-	}
+	// The service centre stays first, so DITO's working ack is unchanged, but
+	// the asserted hostname is kept as a retry for Vodafone's 488.
+	assertCandidates(t, "unroutable PAI", session.deliveryReportTargets(hostOnly, "+639171234567"),
+		deliveryReportCandidate{uri: "tel:+639171234567", source: "rp_originating"},
+		deliveryReportCandidate{uri: "sip:CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org", source: "asserted_host"},
+		deliveryReportCandidate{
+			uri:    "sip:+639171234567@CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org",
+			source: "service_centre_at_asserted_host",
+		},
+	)
+	assertCandidates(t, "unroutable PAI without RP-OA", session.deliveryReportTargets(hostOnly, ""),
+		deliveryReportCandidate{uri: "tel:+639171234567", source: "identity_smsc"},
+		deliveryReportCandidate{uri: "sip:CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org", source: "asserted_host"},
+		deliveryReportCandidate{
+			uri:    "sip:+639171234567@CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org",
+			source: "service_centre_at_asserted_host",
+		},
+	)
 
 	// The configured service centre only wins when the identity carries no SMSC.
 	noIdentitySMSC := &Session{
 		request:  vowifi.IMSRequest{Identity: vowifi.SIMIdentity{IMSI: "515661000061889"}},
 		provider: &Provider{config: Config{SMSCenter: "+447700900123"}},
 	}
-	if got := noIdentitySMSC.deliveryReportTarget(hostOnly, ""); got != "tel:+447700900123" {
-		t.Fatalf("SMSCenter fallback target = %q", got)
-	}
+	assertCandidates(t, "SMSCenter fallback", noIdentitySMSC.deliveryReportTargets(hostOnly, ""),
+		deliveryReportCandidate{uri: "tel:+447700900123", source: "config_smsc"},
+		deliveryReportCandidate{uri: "sip:CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org", source: "asserted_host"},
+		deliveryReportCandidate{
+			uri:    "sip:+447700900123@CO051CN01-MOneIPSMGW1.ims.mnc066.mcc515.3gppnetwork.org",
+			source: "service_centre_at_asserted_host",
+		},
+	)
 
-	// A user-carrying PAI is routable and wins over the configured SMSC.
-	withUser := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
-		"p-asserted-identity": {"<sip:user@example.test>"},
+	// With neither a service centre nor an asserted identity, the From URI is
+	// all that is left to answer.
+	fromOnly := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+		"from": {"<sip:ipsmgw@example.test>;tag=gw"},
 	}}
-	if got := session.deliveryReportTarget(withUser, ""); got != "sip:user@example.test" {
-		t.Fatalf("PAI user target = %q", got)
-	}
+	assertCandidates(t, "From fallback",
+		(&Session{provider: &Provider{}}).deliveryReportTargets(fromOnly, ""),
+		deliveryReportCandidate{uri: "sip:ipsmgw@example.test", source: "from"},
+	)
 
-	// A tel: PAI is also routable.
+	// A user-carrying PAI names the IP-SM-GW instance that delivered the
+	// message and must be tried first, with the service centre kept as retry.
+	withUser := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
+		"p-asserted-identity": {"<sip:+447785011213@ims.mnc015.mcc234.3gppnetwork.org>"},
+	}}
+	assertCandidates(t, "routable PAI", session.deliveryReportTargets(withUser, "+447785011213"),
+		deliveryReportCandidate{uri: "sip:+447785011213@ims.mnc015.mcc234.3gppnetwork.org", source: "p_asserted_identity"},
+		deliveryReportCandidate{uri: "tel:+447785011213", source: "rp_originating"},
+	)
+
+	// A tel: PAI equal to the RP-OA leaves a single distinct candidate.
 	telPAI := &sipRequest{Method: "MESSAGE", Headers: map[string][]string{
 		"p-asserted-identity": {"<tel:+639171234567>"},
 	}}
-	if got := session.deliveryReportTarget(telPAI, ""); got != "tel:+639171234567" {
-		t.Fatalf("tel: PAI target = %q", got)
+	assertCandidates(t, "tel: PAI", session.deliveryReportTargets(telPAI, "+639171234567"),
+		deliveryReportCandidate{uri: "tel:+639171234567", source: "p_asserted_identity"},
+	)
+
+	// Nothing to answer at all stays reported as such.
+	if got := (&Session{provider: &Provider{}}).deliveryReportTargets(&sipRequest{Method: "MESSAGE"}, ""); len(got) != 0 {
+		t.Fatalf("bare request candidates = %+v", got)
+	}
+}
+
+func TestPromoteDeliveryRouteKeepsRejectedTargetsAsFallbacks(t *testing.T) {
+	candidates := []deliveryReportCandidate{
+		{uri: "tel:+447785011213", source: "rp_originating"},
+		{uri: "sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org", source: "asserted_host"},
+		{uri: "sip:+447785011213@ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org", source: "service_centre_at_asserted_host"},
+	}
+	// Vodafone UK accepts the asserted hostname, so it leads next time and the
+	// service centre stays available behind it.
+	assertCandidates(t, "learned route", promoteDeliveryRoute(candidates, "asserted_host"),
+		candidates[1], candidates[0], candidates[2],
+	)
+	// DITO's ack succeeds on the first candidate, which must not reshuffle it.
+	assertCandidates(t, "already first", promoteDeliveryRoute(candidates, "rp_originating"),
+		candidates[0], candidates[1], candidates[2],
+	)
+	// A route learned from another service centre is simply not present.
+	assertCandidates(t, "unknown route", promoteDeliveryRoute(candidates, "identity_smsc"),
+		candidates[0], candidates[1], candidates[2],
+	)
+	if got := promoteDeliveryRoute(candidates[:1], "asserted_host"); len(got) != 1 || got[0] != candidates[0] {
+		t.Fatalf("single candidate = %+v", got)
+	}
+}
+
+func TestSessionRemembersAcceptedDeliveryRoute(t *testing.T) {
+	session := &Session{}
+	if got := session.acceptedDeliveryRoute("sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org"); got != "" {
+		t.Fatalf("unlearned route = %q", got)
+	}
+	session.rememberDeliveryRoute("sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org", "asserted_host")
+	if got := session.acceptedDeliveryRoute("sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org"); got != "asserted_host" {
+		t.Fatalf("learned route = %q", got)
+	}
+	// A different IP-SM-GW keeps its own answer.
+	if got := session.acceptedDeliveryRoute("tel:+639171234567"); got != "" {
+		t.Fatalf("cross-carrier route = %q", got)
+	}
+
+	// The asserted identity identifies the gateway; the service centre is the
+	// key only when nothing was asserted.
+	if got := deliveryRouteKey("sip:IPSMMS1MC04.ims.mnc015.mcc234.3gppnetwork.org", "447785011213"); got != "sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org" {
+		t.Fatalf("asserted route key = %q", got)
+	}
+	if got := deliveryRouteKey("", "447785011213"); got != "+447785011213" {
+		t.Fatalf("service centre route key = %q", got)
+	}
+	if got := deliveryRouteKey("", ""); got != "" {
+		t.Fatalf("empty route key = %q", got)
+	}
+}
+
+func assertCandidates(t *testing.T, name string, got []deliveryReportCandidate, want ...deliveryReportCandidate) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s candidates = %+v, want %+v", name, got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("%s candidate %d = %+v, want %+v", name, index, got[index], want[index])
+		}
 	}
 }
 

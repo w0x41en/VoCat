@@ -1093,7 +1093,9 @@ func newVoWiFiOrchestrator(
 				"category", "sms", "event", "ims_sms_delivery_report",
 				"device_id", outcome.DeviceID, "kind", outcome.Kind,
 				"call_id", outcome.CallID, "rp_reference", outcome.RPReference,
-				"target", outcome.Target, "sip_status", outcome.StatusCode,
+				"target", outcome.Target, "target_source", outcome.TargetSource,
+				"attempt", outcome.Attempt, "asserted_identity", outcome.AssertedIdentity,
+				"sip_status", outcome.StatusCode,
 				"sip_reason", outcome.ReasonPhrase, "sip_warning", outcome.Warning,
 			}
 			if outcome.Error != "" {

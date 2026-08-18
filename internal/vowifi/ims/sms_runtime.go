@@ -636,39 +636,110 @@ func (session *Session) processSMSMessage(request *sipRequest) {
 }
 
 func (session *Session) sendDeliveryReport(request *sipRequest, report []byte, originating string) {
-	outcome := SMSDeliveryReport{
-		DeviceID: session.request.DeviceID,
-		CallID:   strings.TrimSpace(request.value("Call-ID")),
-		Kind:     "ack",
+	base := SMSDeliveryReport{
+		DeviceID:         session.request.DeviceID,
+		CallID:           strings.TrimSpace(request.value("Call-ID")),
+		Kind:             "ack",
+		AssertedIdentity: firstURI(request.value("P-Asserted-Identity")),
 	}
 	if len(report) >= 2 {
-		outcome.RPReference = int(report[1])
+		base.RPReference = int(report[1])
 		if report[0] != 0x02 {
-			outcome.Kind = "error"
+			base.Kind = "error"
 		}
 	}
-	target := session.deliveryReportTarget(request, originating)
-	outcome.Target = target
-	if target == "" {
-		outcome.Error = "inbound message carried no address to acknowledge"
-		session.reportSMSDelivery(outcome)
+	routeKey := deliveryRouteKey(base.AssertedIdentity, originating)
+	targets := promoteDeliveryRoute(
+		session.deliveryReportTargets(request, originating),
+		session.acceptedDeliveryRoute(routeKey),
+	)
+	if len(targets) == 0 {
+		base.Error = "inbound message carried no address to acknowledge"
+		session.reportSMSDelivery(base)
 		return
 	}
-	response, err := session.sendSIPMessage(
-		context.Background(),
-		target,
-		report,
-		outcome.CallID,
-	)
-	if err != nil {
-		outcome.Error = err.Error()
+	for index, candidate := range targets {
+		outcome := base
+		outcome.Attempt = index + 1
+		outcome.Target = candidate.uri
+		outcome.TargetSource = candidate.source
+		response, err := session.sendSIPMessage(
+			context.Background(),
+			candidate.uri,
+			report,
+			outcome.CallID,
+		)
+		if err != nil {
+			outcome.Error = err.Error()
+		}
+		if response != nil {
+			outcome.StatusCode = response.StatusCode
+			outcome.ReasonPhrase = strings.TrimSpace(response.Reason)
+			outcome.Warning = strings.TrimSpace(response.value("Warning"))
+		}
+		session.reportSMSDelivery(outcome)
+		if err != nil {
+			// A transport failure is not something a different Request-URI can
+			// repair, and the service centre will redeliver anyway.
+			return
+		}
+		if response != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+			session.rememberDeliveryRoute(routeKey, candidate.source)
+			return
+		}
 	}
-	if response != nil {
-		outcome.StatusCode = response.StatusCode
-		outcome.ReasonPhrase = strings.TrimSpace(response.Reason)
-		outcome.Warning = strings.TrimSpace(response.value("Warning"))
+}
+
+// deliveryRouteKey identifies the service centre a routing preference was
+// learned from. The asserted identity is the IP-SM-GW that delivered the
+// message and is the more specific of the two.
+func deliveryRouteKey(asserted, originating string) string {
+	if asserted = strings.TrimSpace(asserted); asserted != "" {
+		return strings.ToLower(asserted)
 	}
-	session.reportSMSDelivery(outcome)
+	return normalizeE164(originating)
+}
+
+func (session *Session) acceptedDeliveryRoute(key string) string {
+	if key == "" {
+		return ""
+	}
+	session.deliveryRoutesMu.Lock()
+	defer session.deliveryRoutesMu.Unlock()
+	return session.deliveryRoutes[key]
+}
+
+func (session *Session) rememberDeliveryRoute(key, source string) {
+	if key == "" || source == "" {
+		return
+	}
+	session.deliveryRoutesMu.Lock()
+	defer session.deliveryRoutesMu.Unlock()
+	if session.deliveryRoutes == nil {
+		session.deliveryRoutes = make(map[string]string)
+	}
+	session.deliveryRoutes[key] = source
+}
+
+// promoteDeliveryRoute moves the routing this service centre last accepted to
+// the front, keeping the rest as fallbacks in their original order. Vodafone UK
+// accepts an ack addressed to its asserted hostname but rejects most of the
+// same acks routed by service-centre number, so without this every message
+// pays for one 488 before succeeding.
+func promoteDeliveryRoute(candidates []deliveryReportCandidate, source string) []deliveryReportCandidate {
+	if source == "" || len(candidates) < 2 {
+		return candidates
+	}
+	for index, candidate := range candidates {
+		if candidate.source != source {
+			continue
+		}
+		promoted := make([]deliveryReportCandidate, 0, len(candidates))
+		promoted = append(promoted, candidate)
+		promoted = append(promoted, candidates[:index]...)
+		return append(promoted, candidates[index+1:]...)
+	}
+	return candidates
 }
 
 func (session *Session) reportSMSDelivery(outcome SMSDeliveryReport) {
@@ -1142,29 +1213,75 @@ func normalizeE164(value string) string {
 	return value
 }
 
-// deliveryReportTarget chooses where to route an SMS delivery report. The
-// Request-URI of the outbound MESSAGE is what the S-CSCF routes on, so it must
-// name a real user; a bare hostname (e.g. an IP-SM-GW asserted identity with no
-// user part) is not resolvable by the home I-CSCF and draws 403 "Invalid User".
-func (session *Session) deliveryReportTarget(request *sipRequest, originating string) string {
-	// 1. The RP-OA of the inbound RP-DATA is the service centre; routing to it
-	//    mirrors the mobile-originated path (tel:+<SMSC>).
-	if smsc := normalizeE164(originating); smsc != "" {
-		return "tel:" + smsc
+type deliveryReportCandidate struct {
+	uri    string
+	source string
+}
+
+// deliveryReportTargets lists the Request-URIs an RP-ACK may be sent to, best
+// first, so a rejection can be retried against the next reading of where the
+// report belongs. Every candidate is derived from the inbound message itself,
+// so a retry can only ever reach an entity involved in this delivery.
+//
+// The Request-URI is what the S-CSCF routes on, so it normally has to name a
+// user: DITO asserts a bare IP-SM-GW hostname, which the home I-CSCF answers
+// with 403 "Invalid User", and routing to the RP-OA service centre is what made
+// its acks work. Vodafone UK asserts a bare hostname too
+// (sip:ipsmms1mc04.ims.mnc015.mcc234.3gppnetwork.org) but answers most
+// service-centre-routed acks with 488 "Not Acceptable Here" while accepting the
+// occasional one — the shape of an ack reaching an IP-SM-GW instance that holds
+// no matching RP transaction, since the Call-ID names one instance of a
+// cluster. So the asserted hostname is kept as a retry, in both of its
+// plausible routable forms.
+func (session *Session) deliveryReportTargets(request *sipRequest, originating string) []deliveryReportCandidate {
+	var candidates []deliveryReportCandidate
+	add := func(uri, source string) {
+		uri = strings.TrimSpace(uri)
+		if uri == "" {
+			return
+		}
+		for _, existing := range candidates {
+			if strings.EqualFold(existing.uri, uri) {
+				return
+			}
+		}
+		candidates = append(candidates, deliveryReportCandidate{uri: uri, source: source})
 	}
-	// 2. P-Asserted-Identity, but only when it names a user.
-	if target := firstURI(request.value("P-Asserted-Identity")); usableDeliveryTarget(target) {
-		return target
+	asserted := firstURI(request.value("P-Asserted-Identity"))
+	// 1. P-Asserted-Identity, when it names a user: TS 24.341 §5.3.2.4 answers
+	//    the IP-SM-GW that delivered the message.
+	if usableDeliveryTarget(asserted) {
+		add(asserted, "p_asserted_identity")
 	}
-	// 3. The configured service centre, in the same form as MO submission.
-	if smsc := normalizeE164(session.request.Identity.SMSC); smsc != "" {
-		return "tel:" + smsc
+	// 2. The RP-OA of the inbound RP-DATA is the service centre; routing to it
+	//    mirrors the mobile-originated path (tel:+<SMSC>). The configured
+	//    service centre stands in when the RP-DATA carried no originating
+	//    address, in the same form as MO submission.
+	serviceCentre := normalizeE164(originating)
+	switch {
+	case serviceCentre != "":
+		add("tel:"+serviceCentre, "rp_originating")
+	case normalizeE164(session.request.Identity.SMSC) != "":
+		serviceCentre = normalizeE164(session.request.Identity.SMSC)
+		add("tel:"+serviceCentre, "identity_smsc")
+	case normalizeE164(session.provider.config.SMSCenter) != "":
+		serviceCentre = normalizeE164(session.provider.config.SMSCenter)
+		add("tel:"+serviceCentre, "config_smsc")
 	}
-	if smsc := normalizeE164(session.provider.config.SMSCenter); smsc != "" {
-		return "tel:" + smsc
+	// 3. The asserted hostname, as-is and carrying the service centre as user
+	//    part, to reach the instance that delivered this message.
+	if asserted != "" && !usableDeliveryTarget(asserted) {
+		add(asserted, "asserted_host")
+		if host := sipHost(asserted); host != "" && serviceCentre != "" {
+			add("sip:"+serviceCentre+"@"+host, "service_centre_at_asserted_host")
+		}
 	}
-	// 4. Last resort: the asserted From identity.
-	return firstURI(request.value("From"))
+	// 4. Last resort: the asserted From identity, and only when nothing above
+	//    named an address to answer.
+	if len(candidates) == 0 {
+		add(firstURI(request.value("From")), "from")
+	}
+	return candidates
 }
 
 // usableDeliveryTarget reports whether a SIP Request-URI names a routable user:
@@ -1185,6 +1302,27 @@ func usableDeliveryTarget(target string) bool {
 	}
 	at := strings.IndexByte(rest, '@')
 	return at > 0 && strings.TrimSpace(rest[:at]) != ""
+}
+
+// sipHost returns the host part of a sip:/sips: URI, without the user part,
+// port or parameters. It is empty for anything else.
+func sipHost(uri string) string {
+	uri = strings.TrimSpace(uri)
+	lower := strings.ToLower(uri)
+	if !strings.HasPrefix(lower, "sip:") && !strings.HasPrefix(lower, "sips:") {
+		return ""
+	}
+	rest := uri[strings.IndexByte(uri, ':')+1:]
+	if separator := strings.IndexAny(rest, ";?"); separator >= 0 {
+		rest = rest[:separator]
+	}
+	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+		rest = rest[at+1:]
+	}
+	if port := strings.LastIndexByte(rest, ':'); port >= 0 && !strings.Contains(rest, "]") {
+		rest = rest[:port]
+	}
+	return strings.TrimSpace(rest)
 }
 
 func firstURI(value string) string {
