@@ -215,6 +215,18 @@ func (session *productionQMIRadioSession) GetCellLocationInfo(ctx context.Contex
 // copying that mask into NAS avoids carrying an old profile's narrow band
 // lock (for example LTE 1/3/5) into a different country or roaming profile.
 func (session *productionQMIRadioSession) ResetNetworkSelection(ctx context.Context) error {
+	return session.resetNetworkSelection(ctx, true)
+}
+
+// ResetNetworkSelectionWithoutSearch clears a stale PLMN/band restriction
+// without asking the modem to start acquisition.  Profile switches that must
+// remain in RF-off use this variant; the later SetFlight(false) is the point
+// at which a cellular policy is allowed to search again.
+func (session *productionQMIRadioSession) ResetNetworkSelectionWithoutSearch(ctx context.Context) error {
+	return session.resetNetworkSelection(ctx, false)
+}
+
+func (session *productionQMIRadioSession) resetNetworkSelection(ctx context.Context, forceSearch bool) error {
 	if session == nil || session.nas == nil {
 		if session != nil && session.nasErr != nil {
 			return session.nasErr
@@ -233,6 +245,9 @@ func (session *productionQMIRadioSession) ResetNetworkSelection(ctx context.Cont
 	}
 	if err := session.nas.SetSystemSelectionPreference(ctx, pref); err != nil {
 		return fmt.Errorf("restore automatic QMI NAS selection: %w", err)
+	}
+	if !forceSearch {
+		return nil
 	}
 	// OpenStick firmware accepts the selection update and starts acquisition,
 	// but returns OperationNotSupported for the optional force-search command.
@@ -284,7 +299,16 @@ func (manager *Manager) resetNativeQMIModemForProfileSwitchLocked(
 	id string,
 	state *managedDevice,
 ) (bool, error) {
-	return manager.resetNativeQMIModemLocked(ctx, id, state, "sim_switch", true)
+	return manager.resetNativeQMIModemForProfileSwitchLockedWithPolicy(ctx, id, state, false)
+}
+
+func (manager *Manager) resetNativeQMIModemForProfileSwitchLockedWithPolicy(
+	ctx context.Context,
+	id string,
+	state *managedDevice,
+	keepRadioOff bool,
+) (bool, error) {
+	return manager.resetNativeQMIModemLockedWithPolicy(ctx, id, state, "sim_switch", true, keepRadioOff)
 }
 
 // resetNativeQMIModemForSMSLocked is a last-resort recovery for a WMS card
@@ -312,6 +336,17 @@ func (manager *Manager) resetNativeQMIModemLocked(
 	state *managedDevice,
 	reason string,
 	markRecovery bool,
+) (bool, error) {
+	return manager.resetNativeQMIModemLockedWithPolicy(ctx, id, state, reason, markRecovery, false)
+}
+
+func (manager *Manager) resetNativeQMIModemLockedWithPolicy(
+	ctx context.Context,
+	id string,
+	state *managedDevice,
+	reason string,
+	markRecovery bool,
+	keepRadioOff bool,
 ) (bool, error) {
 	controlDevice, native, err := manager.nativeQMIControl(id)
 	if err != nil || !native {
@@ -360,7 +395,41 @@ func (manager *Manager) resetNativeQMIModemLocked(
 		return true, err
 	}
 	defer onlineSession.Close()
-	if selection, ok := onlineSession.(qmiNetworkSelectionSession); ok {
+	if keepRadioOff {
+		// DMS Online is needed to repopulate the eUICC cache, but do not leave
+		// packet service attached while the selection preference is restored.
+		// SetFlight(true) runs immediately after this function as a second,
+		// authoritative guard and moves the modem to low-power.
+		if nas, ok := onlineSession.(interface {
+			AttachDetach(context.Context, bool) error
+		}); ok {
+			detachContext, cancelDetach := manager.withTimeout(ctx, manager.commandTimeout)
+			if detachErr := nas.AttachDetach(detachContext, false); detachErr != nil {
+				cancelDetach()
+				return true, fmt.Errorf("detach QMI packet service during RF-off profile recovery: %w", detachErr)
+			}
+			cancelDetach()
+		}
+	}
+	if keepRadioOff {
+		if selection, ok := onlineSession.(interface {
+			ResetNetworkSelectionWithoutSearch(context.Context) error
+		}); ok {
+			if err := selection.ResetNetworkSelectionWithoutSearch(ctx); err != nil {
+				manager.logEvent(slog.LevelWarn, "QMI network selection preference restore after SIM switch failed",
+					"category", "roaming", "event", "qmi_selection_preference_restore_failed",
+					"device_id", id, "control_path", controlDevice, "error", err)
+				return true, err
+			}
+		} else if selection, ok := onlineSession.(qmiNetworkSelectionSession); ok {
+			if err := selection.ResetNetworkSelection(ctx); err != nil {
+				manager.logEvent(slog.LevelWarn, "QMI network selection restore after SIM switch failed",
+					"category", "roaming", "event", "qmi_selection_restore_failed",
+					"device_id", id, "control_path", controlDevice, "error", err)
+				return true, err
+			}
+		}
+	} else if selection, ok := onlineSession.(qmiNetworkSelectionSession); ok {
 		if err := selection.ResetNetworkSelection(ctx); err != nil {
 			manager.logEvent(slog.LevelWarn, "QMI network selection restore after SIM switch failed",
 				"category", "roaming", "event", "qmi_selection_restore_failed",

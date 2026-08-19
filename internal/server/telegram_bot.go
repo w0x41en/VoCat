@@ -1404,6 +1404,9 @@ func (bot *telegramBot) executeESIMSwitch(ctx context.Context, action telegramPe
 	if err := bot.server.quiesceVoWiFiForESIM(operationContext, action.DeviceID); err != nil {
 		return "", err
 	}
+	if err := bot.server.forceESIMSwitchRadioOff(operationContext, physicalID); err != nil {
+		return "", err
+	}
 	releaseSubscriberChange, err := bot.server.beginVoWiFiSubscriberChange(operationContext, action.DeviceID)
 	if err != nil {
 		return "", err

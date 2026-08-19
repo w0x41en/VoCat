@@ -719,6 +719,18 @@ func validProfileICCID(iccid string) bool {
 	return true
 }
 
+// profileSwitchRadioOff snapshots the radio policy immediately before the
+// EnableProfile APDU. The server-side switch transaction has already forced
+// RF-off for both VoWiFi and cellular switches, but keeping this decision in
+// the device layer also protects direct callers and rollback recovery.
+func (manager *Manager) profileSwitchRadioOff(id string) bool {
+	entry, err := manager.Get(id)
+	if err != nil || entry.Snapshot == nil {
+		return false
+	}
+	return entry.Snapshot.FlightMode || entry.Snapshot.RadioOff
+}
+
 // ESIMListProfiles reads the eUICC profile list via ES10c GetProfilesInfo.
 func (manager *Manager) ESIMListProfiles(ctx context.Context, id string) (EsimInfo, error) {
 	// A switch marks the target before taking the eSIM mutex. Return the last
@@ -789,6 +801,15 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 		return err
 	}
 	defer manager.finishESIMSwitch(id, iccid)
+	// The server-side eSIM transaction puts the modem in RF-off before it
+	// reaches this method. Capture that invariant before the card APDU so the
+	// post-EnableProfile QMI recovery can restore it immediately after DMS
+	// Online is used to repopulate the new subscriber.
+	keepRadioOff := manager.profileSwitchRadioOff(id)
+	manager.logEvent(slog.LevelInfo, "SIM profile switch radio policy captured",
+		"category", "sim_switch", "event", "profile_switch_radio_policy",
+		"device_id", id, "target_iccid_last4", redactSubscriberID(iccid),
+		"keep_radio_off", keepRadioOff)
 	report := func(step, msg string, pct int) {
 		if progress != nil {
 			progress(EsimProgress{Step: step, Msg: msg, Pct: pct})
@@ -885,7 +906,7 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 	// The eUICC may have committed immediately before a transport error. Always
 	// reset and verify after an APDU attempt, including a card-side rejection;
 	// only the live ICCID decides whether the transaction committed.
-	manager.startProfileSwitchRecovery(id, iccid)
+	manager.startProfileSwitchRecoveryWithPolicy(id, iccid, keepRadioOff)
 
 	verifyContext, cancelVerify := context.WithTimeout(context.WithoutCancel(ctx), profileSwitchVerificationTimeout(manager))
 	defer cancelVerify()
@@ -954,7 +975,7 @@ func (manager *Manager) ESIMSwitchProfileWithProgress(
 	if failure == nil {
 		failure = errors.New("target profile did not become active")
 	}
-	return manager.rollbackFailedProfileSwitch(id, iccid, aidHex, previousICCID, previousKnown, failure)
+	return manager.rollbackFailedProfileSwitch(id, iccid, aidHex, previousICCID, previousKnown, keepRadioOff, failure)
 }
 
 // enableProfileAttempt classifies the outcome of one EnableProfile exchange.
@@ -1100,6 +1121,7 @@ func profileSwitchRollbackTimeout(manager *Manager) time.Duration {
 func (manager *Manager) rollbackFailedProfileSwitch(
 	id, targetICCID, aidHex, previousICCID string,
 	previousKnown bool,
+	keepRadioOff bool,
 	switchErr error,
 ) error {
 	rollbackContext, cancel := context.WithTimeout(context.Background(), profileSwitchRollbackTimeout(manager))
@@ -1132,7 +1154,7 @@ func (manager *Manager) rollbackFailedProfileSwitch(
 	attempt, rollbackErr := manager.sendEnableProfile(rollbackContext, id, previousICCID, aidHex, true)
 	if attempt.attempted {
 		manager.markQMIWMSContextPending(id)
-		manager.startProfileSwitchRecovery(id, previousICCID)
+		manager.startProfileSwitchRecoveryWithPolicy(id, previousICCID, keepRadioOff)
 		if waitErr := manager.waitForESIMRecovery(rollbackContext, id); waitErr != nil {
 			rollbackErr = errors.Join(rollbackErr, waitErr)
 		} else if verifyErr := manager.verifySwitchedICCID(rollbackContext, id, previousICCID); verifyErr != nil {
@@ -1157,11 +1179,19 @@ func (manager *Manager) rollbackFailedProfileSwitch(
 		fmt.Errorf("esim: target ICCID %s was not activated and previous ICCID %s could not be restored: %w", targetICCID, previousICCID, errors.Join(switchErr, rollbackErr)))
 }
 
+// startProfileSwitchRecovery keeps the legacy recovery entry point used by
+// disable/delete paths. Profile switches that began with RF-off use the
+// explicit policy-aware variant below.
 func (manager *Manager) startProfileSwitchRecovery(id string, target ...string) {
 	recoveryTarget := ""
 	if len(target) > 0 {
 		recoveryTarget = strings.TrimSpace(target[0])
 	}
+	manager.startProfileSwitchRecoveryWithPolicy(id, recoveryTarget, false)
+}
+
+func (manager *Manager) startProfileSwitchRecoveryWithPolicy(id, recoveryTarget string, keepRadioOff bool) {
+	recoveryTarget = strings.TrimSpace(recoveryTarget)
 	done := make(chan struct{})
 	manager.esimRecoveryMu.Lock()
 	if manager.esimRecoveries == nil {
@@ -1177,13 +1207,13 @@ func (manager *Manager) startProfileSwitchRecovery(id string, target ...string) 
 	manager.esimRecoveryMu.Unlock()
 	manager.logEvent(slog.LevelInfo, "SIM profile modem recovery started",
 		"category", "sim_switch", "event", "profile_switch_recovery_started", "device_id", id,
-		"target_iccid_last4", redactSubscriberID(recoveryTarget))
+		"target_iccid_last4", redactSubscriberID(recoveryTarget), "keep_radio_off", keepRadioOff)
 	go func() {
 		// Every recovery exit clears the legacy flag. The in-flight target is
 		// cleared by ESIMSwitchProfile's own defer and remains authoritative for
 		// the longer ICCID verification window.
 		defer manager.finishRecovery(id)
-		manager.recoverAfterProfileSwitch(id, recoveryTarget)
+		manager.recoverAfterProfileSwitchWithPolicy(id, recoveryTarget, keepRadioOff)
 		manager.esimRecoveryMu.Lock()
 		if manager.esimRecoveries[id] == done {
 			delete(manager.esimRecoveries, id)
@@ -1450,9 +1480,32 @@ func (manager *Manager) renameCachedProfile(id, iccid, nickname string) {
 // initiating HTTP request. EC20 commonly drops the AT port while processing
 // CFUN=1,1, so the reset error is intentionally followed by discovery retries.
 func (manager *Manager) recoverAfterProfileSwitch(id, target string) {
+	manager.recoverAfterProfileSwitchWithPolicy(id, target, false)
+}
+
+func (manager *Manager) recoverAfterProfileSwitchWithPolicy(id, target string, keepRadioOff bool) {
 	resetContext, cancelReset := context.WithTimeout(context.Background(), manager.longTimeout)
-	resetErr := manager.rebootForProfileSwitch(resetContext, id)
+	resetErr := manager.rebootForProfileSwitchWithPolicy(resetContext, id, keepRadioOff)
 	cancelReset()
+	radioRestored := false
+	restoreRadioOff := func() {
+		if !keepRadioOff || radioRestored {
+			return
+		}
+		radioContext, cancelRadio := context.WithTimeout(context.Background(), manager.longTimeout)
+		_, radioErr := manager.SetFlight(radioContext, id, true)
+		cancelRadio()
+		if radioErr != nil {
+			if resetErr == nil {
+				resetErr = fmt.Errorf("preserve RF-off after eSIM modem recovery: %w", radioErr)
+			}
+			manager.logEvent(slog.LevelError, "SIM profile recovery could not preserve RF-off policy",
+				"category", "sim_switch", "event", "profile_switch_radio_off_failed",
+				"device_id", id, "target_iccid_last4", redactSubscriberID(target), "error", radioErr)
+			return
+		}
+		radioRestored = true
+	}
 	// On native OpenStick/QMI devices, a successful DMS reset followed by a
 	// live UIM ICCID read is enough to prove that the subscriber cache has been
 	// repopulated.  Waiting for the AT-oriented Refresh retry loop as well used
@@ -1474,6 +1527,18 @@ func (manager *Manager) recoverAfterProfileSwitch(id, target string) {
 				"uim_last4", redactSubscriberID(live),
 				"elapsed_ms", time.Since(recoveryStartedAt).Milliseconds(),
 				"error", errString(identityErr))
+			// Keep the QMI session Online while reading UIM: some 410 firmware
+			// builds reject UIM reads in low-power. Packet service is already
+			// detached and network acquisition was not requested, so this is a
+			// short identity-read window, not a registration window.
+			restoreRadioOff()
+			if resetErr != nil {
+				// Do not publish a verified card while the radio-policy guard
+				// itself failed. The caller will surface the switch failure and
+				// the fallback refresh will retain the last known snapshot.
+				manager.refreshAfterProfileSwitch(id)
+				return
+			}
 			if identityErr == nil && validProfileICCID(live) {
 				if strings.TrimSpace(target) == "" {
 					// DisableProfile has no active ICCID to publish. The live
@@ -1493,6 +1558,7 @@ func (manager *Manager) recoverAfterProfileSwitch(id, target string) {
 			}
 		}
 	}
+	restoreRadioOff()
 	manager.refreshAfterProfileSwitch(id)
 }
 

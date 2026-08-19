@@ -688,6 +688,10 @@ func (manager *Manager) Reboot(ctx context.Context, id string) error {
 // lock. This mirrors Reboot but is separate so the call site can't recurse into
 // a guarded-reset path.
 func (manager *Manager) rebootForProfileSwitch(ctx context.Context, id string) error {
+	return manager.rebootForProfileSwitchWithPolicy(ctx, id, false)
+}
+
+func (manager *Manager) rebootForProfileSwitchWithPolicy(ctx context.Context, id string, keepRadioOff bool) error {
 	state, err := manager.lookup(id)
 	if err != nil {
 		return err
@@ -697,7 +701,7 @@ func (manager *Manager) rebootForProfileSwitch(ctx context.Context, id string) e
 	if err := manager.validateActive(id, state); err != nil {
 		return err
 	}
-	if handled, resetErr := manager.resetNativeQMIModemForProfileSwitchLocked(ctx, id, state); handled {
+	if handled, resetErr := manager.resetNativeQMIModemForProfileSwitchLockedWithPolicy(ctx, id, state, keepRadioOff); handled {
 		manager.setResult(id, state, nil, resetErr)
 		return resetErr
 	}

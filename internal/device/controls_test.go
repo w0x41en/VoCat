@@ -11,16 +11,17 @@ import (
 )
 
 type fakeQMIRadioSession struct {
-	mode           qmi.OperatingMode
-	iccid          string
-	iccidErr       error
-	getModes       []qmi.OperatingMode
-	setModes       []qmi.OperatingMode
-	attachRequests []bool
-	networkResets  int
-	getErr         error
-	setErr         error
-	closeCount     int
+	mode                       qmi.OperatingMode
+	iccid                      string
+	iccidErr                   error
+	getModes                   []qmi.OperatingMode
+	setModes                   []qmi.OperatingMode
+	attachRequests             []bool
+	networkResets              int
+	networkResetsWithoutSearch int
+	getErr                     error
+	setErr                     error
+	closeCount                 int
 }
 
 func (session *fakeQMIRadioSession) GetOperatingMode(context.Context) (qmi.OperatingMode, error) {
@@ -47,6 +48,11 @@ func (session *fakeQMIRadioSession) SetOperatingMode(_ context.Context, mode qmi
 
 func (session *fakeQMIRadioSession) ResetNetworkSelection(context.Context) error {
 	session.networkResets++
+	return nil
+}
+
+func (session *fakeQMIRadioSession) ResetNetworkSelectionWithoutSearch(context.Context) error {
+	session.networkResetsWithoutSearch++
 	return nil
 }
 
@@ -192,6 +198,36 @@ func TestProfileSwitchRecoveryUsesQMIModemResetForNativeWWAN(t *testing.T) {
 	}
 	if !entry.Recovering {
 		t.Fatal("native modem reset was not exposed as recovering")
+	}
+}
+
+func TestProfileSwitchRecoveryPreservesRFOffPolicyForNativeWWAN(t *testing.T) {
+	manager, atOpener, id := newStartedNativeQMITestManager(t)
+	session := &fakeQMIRadioSession{mode: qmi.ModeOnline}
+	manager.qmiRadioOpener = func(context.Context, string) (qmiRadioSession, error) {
+		return session, nil
+	}
+
+	if err := manager.rebootForProfileSwitchWithPolicy(context.Background(), id, true); err != nil {
+		t.Fatalf("rebootForProfileSwitchWithPolicy() error = %v", err)
+	}
+	if _, err := manager.SetFlight(context.Background(), id, true); err != nil {
+		t.Fatalf("restore RF-off policy: %v", err)
+	}
+	if len(session.setModes) != 3 ||
+		session.setModes[0] != qmi.ModeReset ||
+		session.setModes[1] != qmi.ModeOnline ||
+		session.setModes[2] != qmi.ModeLowPower {
+		t.Fatalf("QMI RF-off recovery modes = %v, want reset, online, low-power", session.setModes)
+	}
+	if len(session.attachRequests) != 2 || session.attachRequests[0] || session.attachRequests[1] {
+		t.Fatalf("QMI packet-service requests = %v, want detach during recovery and RF-off restore", session.attachRequests)
+	}
+	if session.networkResets != 0 || session.networkResetsWithoutSearch != 1 {
+		t.Fatalf("QMI network selection resets = %d (without search = %d), want one preference-only reset while RF-off", session.networkResets, session.networkResetsWithoutSearch)
+	}
+	if atOpener.openCount != 0 {
+		t.Fatalf("AT opener used %d times for native RF-off profile-switch reset", atOpener.openCount)
 	}
 }
 

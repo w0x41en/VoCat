@@ -388,6 +388,17 @@ func (s *Server) runESIMSwitch(
 	if transaction != nil && transaction.physicalID == "" {
 		transaction.physicalID = physicalID
 	}
+	// A VoWiFi teardown normally restores the radio state that existed before
+	// the tunnel was enabled.  That state is often DMS Online, so merely
+	// quiescing the runtime leaves a window in which an eSIM switch can attach
+	// to a base station.  A profile switch is already a subscriber boundary;
+	// keep the modem RF-off until the target card policy is applied below.
+	if err := s.forceESIMSwitchRadioOff(ctx, physicalID); err != nil {
+		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
+			s.logger.Error("restore VoWiFi after radio-off preflight failure", "device_id", configID, "error", restoreErr)
+		}
+		return &esimCardOperationFailure{stage: "quiesce", err: err}
+	}
 	releaseSubscriberChange, err := s.beginVoWiFiSubscriberChange(ctx, configID)
 	if err != nil {
 		if restoreErr := s.restoreESIMVoWiFiTransaction(transaction); restoreErr != nil {
@@ -424,6 +435,31 @@ func (s *Server) runESIMSwitch(
 	if err := s.applyESIMCardPolicy(ctx, configID, physicalID, iccid); err != nil {
 		s.logger.Error("apply target card policy after eSIM switch", "device_id", configID, "iccid", iccid, "error", err)
 		return &esimCardOperationFailure{stage: "policy", err: err}
+	}
+	return nil
+}
+
+// forceESIMSwitchRadioOff establishes the radio invariant for a profile
+// switch.  SetFlight is authoritative for RF/NAS teardown; stopping the data
+// session first prevents a still-running qmi-network process from recreating
+// a packet service while the DMS mode is changing.  A data-stop failure is
+// logged and tolerated because some OpenStick images have no active data
+// session, but a flight-mode failure is fatal and leaves the transaction
+// blocked rather than allowing an unplanned cellular attach.
+func (s *Server) forceESIMSwitchRadioOff(ctx context.Context, physicalID string) error {
+	if s.devices == nil || strings.TrimSpace(physicalID) == "" {
+		return nil
+	}
+	if _, err := s.devices.SetNetwork(ctx, physicalID, device.NetworkRequest{
+		Enabled:   false,
+		IPVersion: "IP",
+	}); err != nil {
+		s.logger.Warn("stop cellular data before eSIM switch returned an error",
+			"category", "sim_switch", "event", "profile_switch_data_stop_failed",
+			"device_id", physicalID, "error", err)
+	}
+	if _, err := s.devices.SetFlight(ctx, physicalID, true); err != nil {
+		return fmt.Errorf("enter RF-off mode before eSIM switch: %w", err)
 	}
 	return nil
 }
